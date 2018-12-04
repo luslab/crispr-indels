@@ -1,0 +1,119 @@
+---
+title: "Chromatin modification CRISPR experiments"
+author: "A. M. Chakrabarti"
+date: "Last updated: 15th November 2017"
+output:
+   html_document:
+     code_folding: hide
+     collapsed: no
+     fig_align: center
+     fig_caption: yes
+     fig_height: 6
+     fig_width: 12
+     highlight: haddock
+     keep_md: yes
+     number_sections: yes
+     smooth_scroll: no
+     toc: yes
+     toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+library(data.table)
+library(CrispRVariants)
+library(GenomicRanges)
+library(rtracklayer)
+library(gdata)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(cowplot)
+library(scales)
+library(pheatmap)
+library(RColorBrewer)
+library(ggforce)
+library(GenomicAlignments)
+library(parallel)
+library(ShortRead)
+library(stringr)
+
+TxDb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+
+options(stringsAsFactors = FALSE)
+```
+
+# Metadata
+
+Then I load Josep's metadata table, wrangle out sgRNA and conditions and add mapped file paths for analysis. I also load the target locations of the sgRNA guides.
+
+```{r metadata}
+metadata <- data.table(read.xls("~/Dropbox (Lab)/CRISPR-indels/validation/metadata/Samples ID.xlsx", sheet = 2))
+
+# Get conditions
+metadata <- metadata[, `:=` (sgrna = sapply(strsplit(short.info, " "), "[", 3),
+                             drug = sapply(strsplit(short.info, " "), "[", 1),
+                             dose = sapply(strsplit(short.info, " "), "[", 2),
+                             replicate = sapply(strsplit(short.info, " "), "[", 4),
+                             pool = gsub(" ", "", X))]
+metadata <- metadata[, info := paste0(drug, "_", dose, "_", replicate)]
+
+# Add bam file paths
+metadata <- metadata[, bam.file := paste0("mapped/sam1.3/",pool, ".q38.bam")]
+metadata <- metadata[, sam1.4.bam.file := paste0("mapped/sam1.4/", pool, ".q38.bam")]
+
+# Order
+setorder(metadata, sgrna, info)
+
+# Next get the GRanges for the relevant sgRNA
+sgrna.all <- import.bed("~/Scaffidi/sgrna/sgRNA_PAM_hg19_curated.bed")
+
+sgrna.targets <- c("ACTL6A.5", "ASF1B.7", "BRD2.7", "MBD3L1.6", "MSH6.2", "SMARCD2.1")
+sgrna.targets.gr.list <- lapply(sgrna.targets, function(x) sgrna.all[sgrna.all$name == x])
+names(sgrna.targets.gr.list) <- sgrna.targets
+```
+
+# Indel profiles
+
+With the greater depth of coverage and the single end reads spanning the entire region of interest we can examine the indels at each location, for each experiment in closer detail.
+
+```{r crisprvariants, message = FALSE, eval = FALSE}
+ptm <- proc.time()
+cl <- makeForkCluster(6)
+cv.list <- parLapply(cl = cl, 1:length(sgrna.targets), function(i) {
+  
+  message(sgrna.targets[i])
+  sgrna <- sgrna.targets.gr.list[[i]]
+  bam.files <- metadata[sgrna == sgrna.targets[i]]$bam.file
+  cleavage.gr <- resize(resize(sgrna, width = 6, fix = "end"), width = 1, fix = "start")
+  
+  guide_strand <- as.character(strand(cleavage.gr))
+  if(guide_strand == "-") cleavage.gr <- shift(cleavage.gr, 1) # Need to correct positioning for CrispRVariants
+  
+  gdl <- resize(cleavage.gr, width = 250, fix = "center")
+  info <- metadata[sgrna == sgrna.targets[i]]$info
+  ref.gdl <- getSeq(Hsapiens, gdl)
+
+  crispr_set <- readsToTarget(bam.files,
+                            names = info,
+                            target = gdl, 
+                            reference = ref.gdl, 
+                            target.loc = 125)
+  
+  pdf(paste0("plots/", sgrna.targets[i], ".pdf"), width = 25, height = 15)
+  plotVariants(crispr_set,
+             plotAlignments.args = list(plot.text.size = 2),
+             plotFreqHeatmap.args = list(plot.text.size = 3))
+  dev.off()
+  
+  return(crispr_set)
+  
+})
+stopCluster(cl)
+proc.time() - ptm
+
+names(cv.list) <- sgrna.targets
+saveRDS(cv.list, "cv.list.rds")
+```
