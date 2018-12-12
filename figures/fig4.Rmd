@@ -1,0 +1,375 @@
+---
+title: "CRISPR Indels Fig. 4"
+author: "A. M. Chakrabarti"
+date: "Last updated: 16th October 2018"
+output: 
+  html_notebook: 
+    code_folding: hide
+    fig_align: center
+    fig_height: 10
+    fig_width: 12
+    highlight: haddock
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE}
+library(data.table)
+library(ggplot2)
+library(rtracklayer)
+library(cowplot)
+library(ggthemes)
+library(scales)
+library(parallel)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(pheatmap)
+library(stringr)
+library(RColorBrewer)
+library(dunn.test)
+library(CrispRVariants)
+library(viridis)
+library(ggforce)
+library(ggsignif)
+
+setwd("~/Scaffidi/revisions/")
+output.dir <- "~/Scaffidi/revisions/plots/fig4"
+if(!dir.exists(output.dir)) dir.create(output.dir)
+
+```
+
+# Get precision groups
+
+```{r}
+all.indels.gr <- readRDS("~/Scaffidi/revisions/all.indels.revised.gr.rds")
+
+indels.dt <- as.data.table(all.indels.gr)
+indels.dt[, indel_count := .N, by = .(seqnames, start, end, nt, sgrna)]
+indels.dt[, total_indels := .N, by = .(sgrna)]
+indels.dt[, indel_frequency := indel_count/total_indels]
+indels.dt[, max_indel_frequency := max(indel_frequency), by = sgrna]
+
+# Assign indel precision
+indels.dt[max_indel_frequency > 0 & max_indel_frequency <= 0.25, group := "I"]
+indels.dt[max_indel_frequency > 0.25 & max_indel_frequency <= 0.5, group := "M"]
+indels.dt[max_indel_frequency > 0.5 & max_indel_frequency <= 1, group := "P"]
+
+sgrna.threshold <- unique(indels.dt[total_indels >= 10]$sgrna)
+```
+
+# Get microhomology results
+
+```{r}
+# ==========
+# Microhomology
+# ==========
+
+all.indels.gr <- readRDS("~/Scaffidi/revisions/all.indels.revised.gr.rds")
+
+deletions.gr <- all.indels.gr[all.indels.gr$indel == "Deletion"]
+deletions.gr$id <- 1:length(deletions.gr)
+
+# Assess for microhomology
+
+cl <- makeForkCluster(4)
+mh_l <- parLapply(cl = cl, 1:50, function(x) {
+  
+  longenough.deletions.gr <- deletions.gr[width(deletions.gr) >= x]
+  
+  # Get window and sequence
+  start <- resize(longenough.deletions.gr, width = 1, fix = "start")
+  end <- resize(longenough.deletions.gr, width = 1, fix = "end")
+  
+  start.gr <- shift(resize(start, width = x, fix = "end"), -1)
+  start.gr$sequence <- getSeq(Hsapiens, start.gr)
+  
+  end.gr <- resize(end, width = x, fix = "end")
+  end.gr$sequence <- getSeq(Hsapiens, end.gr)
+  
+  res <- start.gr$sequence == end.gr$sequence
+  mh <- data.table(id = start.gr$id[res], mh = as.character(start.gr$sequence[res]))
+  
+  return(mh)
+  
+})
+
+mh_r <- parLapply(cl = cl, 1:50, function(x) {
+  
+  longenough.deletions.gr <- deletions.gr[width(deletions.gr) >= x]
+  
+  # Get window and sequence
+  start <- resize(longenough.deletions.gr, width = 1, fix = "start")
+  end <- resize(longenough.deletions.gr, width = 1, fix = "end")
+  
+  start.gr <- resize(start, width = x, fix = "start")
+  start.gr$sequence <- getSeq(Hsapiens, start.gr)
+  
+  end.gr <- shift(resize(end, width = x, fix = "start"), 1)
+  end.gr$sequence <- getSeq(Hsapiens, end.gr)
+  
+  res <- start.gr$sequence == end.gr$sequence
+  mh <- data.table(id = start.gr$id[res], mh = as.character(start.gr$sequence[res]))
+  
+  return(mh)
+  
+})
+
+stopCluster(cl)
+mh <- rbind(rbindlist(mh_l), rbindlist(mh_r))
+
+# If multiple microhomologies, keep the longest
+mh[, length_mh := nchar(mh)][, max_length_mh := max(length_mh), by = id]
+longest.mh <- mh[length_mh == max_length_mh]
+longest.mh[, `:=` (length_mh = NULL, max_length_mh = NULL)]
+
+# If mulitple microhomogoles of same length, keep one with highest GC
+longest.mh[, n_gc := str_count(mh, "G|C")]
+setorder(longest.mh, n_gc, id)
+longest.mh <- unique(longest.mh, by = "id")[, n_gc := NULL]
+
+deletions.dt <- as.data.table(deletions.gr)
+deletions.dt <- merge(deletions.dt, longest.mh, by = "id", all.x = TRUE)
+deletions.dt[is.na(mh), mmej := FALSE][!is.na(mh), mmej := TRUE]
+
+stopifnot(nrow(deletions.dt) == length(deletions.gr))
+```
+
+# A - Microhomology overview
+
+```{r}
+mh.dt <- dcast.data.table(deletions.dt[, .N, by = .(mmej, sgrna)], sgrna ~ mmej, value.var = "N")
+setnames(mh.dt, c("sgrna", "nomh", "mh"))
+mh.dt[is.na(nomh), nomh := 0]
+mh.dt[is.na(mh), mh := 0]
+mh.dt[, total_indels := nomh + mh]
+
+mh.dt[, prop_mh := mh/total_indels]
+
+ggplot(mh.dt[sgrna %in% sgrna.threshold], aes(x = reorder(sgrna, prop_mh), y = prop_mh)) +
+  geom_bar(stat = "identity", width = 1, fill = "#370335FF") + # show_col(pal_simpsons("springfield")(16))
+  labs(# title = "Incidence of microhomology deletions",
+       # subtitle = "Targets with at least 10 indel reads",
+       x = "Targets",
+       y = "Percentage of MH-deletions") +
+  geom_hline(yintercept = mean(mh.dt$prop_mh), linetype = "dashed", colour = "black") +
+  annotate("text", x = 0, y = 0.78, label = "Mean percentage", hjust = -0.1) +
+  scale_x_discrete(labels = NULL) +
+  scale_y_continuous(labels = percent) +
+  theme_cowplot() + theme(axis.line.x = element_blank(), axis.ticks.x = element_blank())
+
+ggsave(file.path(output.dir, "mh.pdf"), width = 9, height = 3.5, units = "in")
+```
+
+Inset pie chart
+
+```{r}
+ggplot(deletions.dt[sgrna %in% sgrna.threshold, .N, by = mmej], aes(x = factor(1), y = N, fill = factor(mmej))) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y") +
+  scale_fill_manual(values = c("#1A9993FF", "#370335FF"), labels = c("No MH", "MH")) + # show_col(canva_pal("Cool blues")(4))
+  labs(# title = "Proportion of deletions showing microhomology",
+       # subtitle = "Targets with at least 10 indel reads",
+       fill = "") +
+  theme_cowplot() +
+  theme(legend.position = "none", axis.text = element_blank(), axis.title = element_blank(), panel.border = element_blank(), panel.grid = element_blank(), axis.ticks = element_blank(), axis.line = element_blank())
+
+ggsave(file.path(output.dir, "mh_overview.pdf"), width = 7, height = 7, units = "in")
+```
+
+# B - Microhomology size
+
+```{r}
+ctrl.mh.dt <- data.table(mh = 1:max(nchar(deletions.dt[mmej == TRUE]$mh)))
+ctrl.mh.dt[, prob := 1/(4^mh)]
+
+del.mh.dt <- deletions.dt[sgrna %in% sgrna.threshold & mmej == TRUE, .N, by = nchar(mh)]
+total.deletions <- nrow(deletions.dt[sgrna %in% sgrna.threshold])
+del.mh.dt[, percentage := N/total.deletions]
+
+ggplot() +
+  geom_bar(data = del.mh.dt, aes(x = nchar, y = percentage), stat = "identity", fill = "#370335FF", colour = "white", size = 1) +
+  geom_bar(data = ctrl.mh.dt, aes(x = mh, y = prob), stat = "identity", colour = "grey50", fill = NA, size = 1) +
+  labs(x = "Size of microhomology",
+       y = "Percentage of deletions") +
+  scale_y_continuous(label = percent) +
+  scale_x_continuous(breaks = 1:10) +
+  coord_cartesian(xlim = 0.5:8) +
+  theme_cowplot()
+
+ggsave(file.path(output.dir, "mh_size.pdf"), width = 7, height = 5, units = "in")
+```
+
+# D - Microhomology and precision
+
+```{r}
+mh.prec.dt <- merge(mh.dt, unique(indels.dt[total_indels >= 10, .(sgrna, group)]), by = "sgrna")
+
+kruskal.test(list(I = mh.prec.dt[group == "I"]$prop_mh,
+               M = mh.prec.dt[group == "M"]$prop_mh,
+               P = mh.prec.dt[group == "P"]$prop_mh))
+
+res <- dunn.test(list(I = mh.prec.dt[group == "I"]$prop_mh,
+               M = mh.prec.dt[group == "M"]$prop_mh,
+               P = mh.prec.dt[group == "P"]$prop_mh),
+          method = "bh")
+
+ggplot(mh.prec.dt, aes(x = group, y = prop_mh, colour = group)) +
+  geom_boxplot(width = 0.5) +
+  geom_signif(annotations = signif(c(res$P.adjusted[1], res$P.adjusted[3]), 3),
+              y_position = c(1.1, 1.2), xmin = c(1, 2), xmax = c(2, 3), colour = "black") +
+  # geom_sina(alpha = 0.5) +
+  scale_colour_tableau(palette = "Classic 10") +
+  labs(# title = "Microhomology and precision",
+       x = "Predictability group",
+       y = "Percentage of MH-deletion per target",
+       colour = "Precision group") +
+  scale_y_continuous(label = percent) +
+  theme_cowplot() + theme(legend.position = "none")
+
+ggsave(file.path(output.dir, "mh_precision.pdf"), width = 5, height = 6, units = "in")
+```
+
+# E - Freqency of commonest insertion
+
+```{r}
+insertions.gr <- all.indels.gr[all.indels.gr$indel == "Insertion"]
+
+ins.dt <- as.data.table(insertions.gr)
+ins.dt[, exp := NULL]
+
+ins.dt[, total_insertions := .N, by = sgrna]
+ins.dt[, insertion_count := .N, by = .(sgrna, start, nt)]
+ins.dt[, insertion_frequency := insertion_count/total_insertions]
+ins.dt[, max_insertion_frequency := max(insertion_frequency), by = sgrna]
+
+ggplot(unique(ins.dt[sgrna %in% sgrna.threshold & total_insertions >= 5, .(sgrna, max_insertion_frequency)]), aes(x = max_insertion_frequency)) +
+  geom_histogram(fill = "grey50", colour = NA, binwidth = 0.05) +
+  scale_x_continuous() +
+  annotate(geom = "text", label = nrow(unique(ins.dt[sgrna %in% sgrna.threshold & total_insertions >= 5, .(sgrna, max_insertion_frequency)])), x = 0, y = 60) +
+  labs(x = "Frequency of commonest insertion",
+       y = "Number of targets") +
+  coord_cartesian(xlim = c(0, 1))
+
+ggsave(file.path(output.dir, "commonest_insertion_frequency_histogram.pdf"), width = 4, height = 3.5)
+```
+
+# G - Insertion homology rate
+
+```{r}
+sgrna.dt <- fread("~/Dropbox (Lab)/CRISPR-indels/ref/sgrna.tsv")
+setnames(sgrna.dt, "id", "sgrna")
+
+insertions.gr <- all.indels.gr[all.indels.gr$indel == "Insertion"]
+insertions.gr$downstream <- as.character(getSeq(Hsapiens, resize(insertions.gr, 5, fix = "start")))
+
+ins.dt <- as.data.table(insertions.gr)
+ins.dt[, exp := NULL]
+
+ins.dt[, total_insertions := .N, by = sgrna]
+ins.dt[, insertion_count := .N, by = .(sgrna, start, nt)]
+ins.dt[, insertion_frequency := insertion_count/total_insertions]
+ins.dt[, max_insertion_frequency := max(insertion_frequency), by = sgrna]
+ins.dt <- merge(ins.dt, unique(indels.dt[total_indels >= 10, .(sgrna, group)]), by = "sgrna")
+
+ins.dt <- merge(ins.dt, sgrna.dt[, .(sgrna, seq, strand, cleavage_site, sgrna_start, sgrna_end)], by = "sgrna")
+ins.dt[, id := 1:.N][, nt_17 := str_sub(seq, 17, 17)][strand.y == "-", nt_17 := as.character(reverseComplement(DNAString(nt_17))), by = id]
+ins.dt[, ins_homology := nt_17 == nt]
+
+ins.dt[, ins_dist := start - cleavage_site]
+
+ih.dt <- dcast.data.table(ins.dt[nchar(nt) == 1, .N, by = .(ins_homology, sgrna)], sgrna ~ ins_homology, value.var = "N")
+setnames(ih.dt, c("sgrna", "noih", "ih"))
+ih.dt[is.na(noih), noih := 0]
+ih.dt[is.na(ih), ih := 0]
+ih.dt[, total_ins := noih + ih]
+
+ih.dt[, prop_ih := ih/total_ins]
+
+ih.prec.dt <- merge(ih.dt, unique(indels.dt[total_indels >= 10, .(sgrna, group)]), by = "sgrna")
+
+kruskal.test(list(I = ih.prec.dt[group == "I"]$prop_ih,
+               M = ih.prec.dt[group == "M"]$prop_ih,
+               P = ih.prec.dt[group == "P"]$prop_ih))
+
+res <- dunn.test(list(I = ih.prec.dt[group == "I"]$prop_ih,
+               M = ih.prec.dt[group == "M"]$prop_ih,
+               P = ih.prec.dt[group == "P"]$prop_ih),
+          method = "bh")
+
+ggplot(ih.prec.dt, aes(x = group, y = prop_ih, colour = group)) +
+  geom_boxplot(width = 0.5) +
+  geom_signif(annotations = signif(c(res$P.adjusted[1], res$P.adjusted[3]), 3),
+              y_position = c(1.1, 1.2), xmin = c(1, 2), xmax = c(2, 3), colour = "black") +
+  # geom_sina(alpha = 0.5) +
+  scale_colour_tableau(palette = "Classic 10") +
+  labs(# title = "Microhomology and precision",
+       x = "Predictability group",
+       y = "Percentage of homologous insertions per target",
+       colour = "Precision group") +
+  scale_y_continuous(label = percent) +
+  theme_cowplot() + theme(legend.position = "none")
+
+ggsave(file.path(output.dir, "ih_precision.pdf"), width = 5, height = 6, units = "in")
+```
+
+# H - Insertion homology - all v. commonest
+
+```{r}
+commonest.ins <- unique(ins.dt[nchar(nt) == 1 & sgrna %in% sgrna.threshold & insertion_frequency == max_insertion_frequency])
+setorder(commonest.ins, sgrna, size, -ins_homology, ins_dist)
+commonest.ins <- unique(commonest.ins, by = "sgrna")
+# commonest.ins <- merge(commonest.ins, unique(indels.dt[total_indels >= 10, .(sgrna, group)]), by = c("sgrna", "group"))
+
+prop.comm.dt <- commonest.ins[nchar(nt) == 1 & total_insertions >= 5, .N, by = .(group, ins_homology)]
+prop.comm.dt <- prop.comm.dt[, total := sum(N), by = group][, prop_comm := N/total][ins_homology == TRUE, .(group, prop_comm)]
+
+# ins.dt <- merge(ins.dt, unique(indels.dt[total_indels >= 10, .(sgrna, group)]), by = c("sgrna", "group"))
+prop.ins.dt <- ins.dt[nchar(nt) == 1, .N, by = .(group, ins_homology)]
+
+prop.chi <- dcast.data.table(prop.ins.dt[group != "M"], group ~ ins_homology, value.var = "N")
+chisq.test(prop.chi[, 2:3, ])
+
+prop.ins.dt <- prop.ins.dt[, total := sum(N), by = group][, prop_ins := N/total][ins_homology == TRUE, .(group, prop_ins)]
+
+combo.ih.dt <- melt.data.table(merge(prop.ins.dt, prop.comm.dt, by = "group"), id.vars = "group")
+
+ggplot(mapping = aes(x = group, y = value)) +
+  geom_bar(data = combo.ih.dt[variable == "prop_ins"], width = 0.8, aes(fill = group, colour = group), stat = "identity") +
+  geom_bar(data = combo.ih.dt[variable == "prop_comm"], aes(colour = group), fill = NA, size = 1, stat = "identity") +
+  scale_fill_tableau(palette = "Classic 10") +
+  scale_colour_tableau(palette = "Classic 10") +
+  scale_y_continuous(label = percent) +
+  labs(x = "Predictability group",
+       y = "Percentage of homologous insertions") +
+  theme_cowplot() + theme(legend.position = "none")
+
+ggsave(file.path(output.dir, "ih_increase_with_commonest.pdf"), width = 5, height = 6)
+```
+
+# I - Nucleotide inserted by precision group
+
+```{r}
+commonest.nt.dt <- unique(ins.dt[sgrna %in% sgrna.threshold & insertion_frequency == max_insertion_frequency])
+setorder(commonest.nt.dt, sgrna, size, -ins_homology, ins_dist)
+commonest.nt.dt <- unique(commonest.nt.dt, by = "sgrna")
+commonest.nt.dt[abs(size) > 1, nt := "Oligo"]
+commonest.nt.dt$nt <- factor(commonest.nt.dt$nt, levels = c("A", "C", "G", "T", "Oligo"))
+
+table(commonest.ins$ins_homology)
+
+ggplot(commonest.nt.dt[total_insertions >= 5], aes(x = group, fill = nt)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c('darkgreen', 'blue', 'orange', 'red', "grey50")) +
+  scale_y_continuous(label = percent) +
+  labs(x = "Predictability group", 
+       y = "Percentage of commonest insertions", fill = "") +
+  theme_cowplot() + theme(legend.position = "none")
+
+
+unique(ins.dt[sgrna %in% sgrna.threshold & total_insertions >= 5, .(sgrna, max_insertion_frequency)])$sgrna[!unique(ins.dt[sgrna %in% sgrna.threshold & total_insertions >= 5, .(sgrna, max_insertion_frequency)])$sgrna %in% commonest.nt.dt$sgrna]
+
+ggsave(file.path(output.dir, "inserted_nucleotide_by_group_commonest.pdf"), width = 2.5, height = 6)
+```
+

@@ -1,0 +1,187 @@
+---
+title: "CRISPR Indels Fig. 2"
+author: "A. M. Chakrabarti"
+date: "Last updated: 16th October 2018"
+output: 
+  html_notebook: 
+    code_folding: hide
+    fig_align: center
+    fig_height: 10
+    fig_width: 12
+    highlight: haddock
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE}
+library(data.table)
+library(ggplot2)
+library(rtracklayer)
+library(cowplot)
+library(ggthemes)
+library(scales)
+library(parallel)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(pheatmap)
+library(stringr)
+library(RColorBrewer)
+library(dunn.test)
+library(CrispRVariants)
+library(viridis)
+
+setwd("~/Scaffidi/revisions/")
+output.dir <- "~/Scaffidi/revisions/plots/fig2"
+if(!dir.exists(output.dir)) dir.create(output.dir)
+
+```
+
+# A - Overview
+
+```{r}
+all.indels.gr <- readRDS("~/Scaffidi/revisions/all.indels.revised.gr.rds")
+indels.dt <- as.data.table(all.indels.gr)
+indels.dt[, indel_count := .N, by = .(seqnames, start, end, nt, sgrna)]
+indels.dt[, total_indels := .N, by = .(sgrna)]
+indels.dt[, indel_frequency := indel_count/total_indels]
+indels.dt[, max_indel_frequency := max(indel_frequency), by = sgrna]
+
+indels.dt[, exp := NULL]
+indels.dt <- unique(indels.dt)
+```
+
+```{r}
+overview.dt <- indels.dt[total_indels >= 10]
+setorder(overview.dt, sgrna, -indel_frequency)
+overview.dt[, id := 1:.N, by = sgrna]
+overview.dt[, total_types_of_indel := max(id), by = sgrna]
+
+cols <- c("#e34a33", colorRampPalette(rev(c("#6BAED6", "#4292C6", "#2171B5", "#08519C", "#08306B")))(median(overview.dt$total_types_of_indel)), rep("grey85", (max(overview.dt$id) - (median(overview.dt$total_types_of_indel) + 1))))
+# cols <- c("#9467BD", colorRampPalette(c("#6BAED6", "#4292C6", "#2171B5", "#08519C", "#08306B"))(median(overview.dt$total_types_of_indel)), rep("gray50", (max(overview.dt$id) - (median(overview.dt$total_types_of_indel) + 1))))
+# cols <- c("#e34a33", colorRampPalette(c("gray35", "gray75"))(median(overview.dt$total_types_of_indel)), rep("gray95", (max(overview.dt$id) - (median(overview.dt$total_types_of_indel) + 1))))
+
+p1 <- ggplot(overview.dt, aes(x = reorder(sgrna, max_indel_frequency), y = -indel_frequency, colour = as.factor(id))) +
+  geom_bar(stat = "identity", fill = NA, width = 1) +
+  scale_colour_manual(values = cols) +
+  theme(legend.position = "none", axis.ticks.x = element_blank(), axis.line.x = element_blank()) +
+  labs(x = "Targets",
+       y = "Indel frequency") +
+  scale_y_continuous(labels = c("0", "0.25", "0.50", "0.75", "1.00")) +
+  scale_x_discrete(labels = NULL)
+
+p3 <- ggplot(unique(overview.dt[, .(sgrna, max_indel_frequency, total_indels, total_types_of_indel)]), aes(x = reorder(sgrna, max_indel_frequency), y = total_types_of_indel/total_indels)) +
+  geom_bar(stat = "identity", fill = "grey50", width = 1, colour = "grey50") +
+  # scale_colour_manual(values = cols) +
+  theme(legend.position = "none", axis.ticks.x = element_blank(), axis.line.x = element_blank()) +
+  labs(x = "",
+       y = "Distinct indel count\nTotal indel count") +
+  # scale_y_log10() +
+  scale_x_discrete(labels = NULL)
+
+p <- plot_grid(p3, p1, align = "v", ncol = 1, rel_heights = c(1.5, 4))
+
+ggsave(plot = p, file.path(output.dir, "indel_frequency_overview_with_norm_counts.pdf"), width = 9, height = 4)
+```
+
+## Metrics
+
+```{r}
+max(overview.dt$total_types_of_indel)
+unique(overview.dt[, .(sgrna, max_indel_frequency, total_types_of_indel)])
+mean(unique(overview.dt[, .(sgrna, max_indel_frequency, total_types_of_indel)])$max_indel_frequency)
+median(unique(overview.dt[, .(sgrna, max_indel_frequency, total_types_of_indel)])$total_types_of_indel)
+```
+
+## Legend
+
+```{r, eval = FALSE}
+pdf(file.path(output.dir, "fig2a_legend.pdf"), width = 3, height = 1)
+image(1:20, 1, as.matrix(1:20), col = cols[1:20], xlab = "", ylab = "")
+dev.off()
+```
+
+# B - Examples
+
+## Top 5
+
+```{r}
+indels.dt <- as.data.table(all.indels.gr)[, exp := NULL]
+sgrna.dt <- fread("~/Dropbox (Lab)/CRISPR-indels/ref/sgrna.tsv")
+setnames(sgrna.dt, "id", "sgrna")
+
+setkey(indels.dt, sgrna)
+setkey(sgrna.dt, sgrna)
+indels.dt <- sgrna.dt[indels.dt]
+
+setorder(overview.dt, -max_indel_frequency)
+
+top5.dt <- indels.dt[sgrna %in% unique(overview.dt$sgrna)[1:5]]
+top5.dt[strand == "+", coord := start - cleavage_site]
+top5.dt[strand == "-", coord := cleavage_site - end]
+top5.dt[, id := paste0(coord, ":", abs(size), str_sub(indel, 1, 1))]
+top5.freq.dt <- top5.dt[, total_indeltype := .N, by = .(sgrna, id)][, total_indels := .N, by = sgrna][, indelfreq := total_indeltype/total_indels]
+
+top5.freq.dt <- unique(top5.freq.dt[, .(sgrna, id, indelfreq, total_indels, indel)])
+top5.freq.dt[, coord := sapply(strsplit(id, "\\:"), "[[", 1)]
+```
+
+## Bottom 5
+
+```{r}
+setorder(overview.dt, max_indel_frequency)
+
+bottom5.dt <- indels.dt[sgrna %in% unique(overview.dt$sgrna)[1:5]]
+bottom5.dt[strand == "+", coord := start - cleavage_site]
+bottom5.dt[strand == "-", coord := cleavage_site - end]
+bottom5.dt[, id := paste0(coord, ":", abs(size), str_sub(indel, 1, 1))]
+bottom5.freq.dt <- bottom5.dt[, total_indeltype := .N, by = .(sgrna, id)][, total_indels := .N, by = sgrna][, indelfreq := total_indeltype/total_indels]
+
+bottom5.freq.dt <- unique(bottom5.freq.dt[, .(sgrna, id, indelfreq, total_indels, indel)])
+bottom5.freq.dt[, coord := sapply(strsplit(id, "\\:"), "[[", 1)]
+```
+
+## Plot
+
+```{r}
+eg.freq.dt <- indels.dt[sgrna %in% c("SETD6.7", "MSH6.2", "CITED2.1", "HMGA2.6", "CBX6.5", "KDM6B.5")]
+eg.freq.dt <- indels.dt[sgrna %in% c("SETD6.7", "MSH6.2", "HMGA2.6", "KDM6B.5")]
+eg.freq.dt[strand == "+", coord := start - cleavage_site]
+eg.freq.dt[strand == "-", coord := cleavage_site - end]
+eg.freq.dt[, id := paste0(coord, ":", abs(size), str_sub(indel, 1, 1))]
+eg.freq.dt[!is.na(nt), id := paste0(id, ":", nt)]
+
+eg.freq.dt <- eg.freq.dt[, total_indeltype := .N, by = .(sgrna, id)][, total_indels := .N, by = sgrna][, indelfreq := total_indeltype/total_indels]
+eg.freq.dt <- unique(eg.freq.dt[, .(sgrna, id, indelfreq, total_indels, indel)])
+eg.freq.dt[, coord := sapply(strsplit(id, "\\:"), "[[", 1)]
+
+cleavage.dt <- data.table(sgrna = unique(eg.freq.dt$sgrna),
+                          id = "0:0",
+                          indelfreq = Inf,
+                          indel = "cleavage",
+                          coord = 0)
+
+eg.freq.dt <- rbind(eg.freq.dt, cleavage.dt, fill = TRUE)
+eg.freq.dt$coord <- as.integer(eg.freq.dt$coord)
+setorder(eg.freq.dt, sgrna, coord, id)
+eg.freq.dt[, rank := 1:.N, by = sgrna]
+# eg.freq.dt$sgrna <- factor(eg.freq.dt$sgrna, levels = c("SETD6.7", "NCOA2.5", "SMC2.5", "CHD2.7", "CBX6.5", "KDM6B.5"))
+eg.freq.dt$sgrna <- factor(eg.freq.dt$sgrna, levels = c("SETD6.7", "MSH6.2", "CITED2.1", "HMGA2.6", "CBX6.5", "KDM6B.5"))
+xmax <- max(eg.freq.dt$rank)
+
+p <- ggplot() +
+  geom_bar(data = eg.freq.dt, aes(x = rank, y = indelfreq, fill = indel), stat = "identity", colour = NA) +
+  facet_grid(. ~ sgrna) +
+  scale_fill_manual(values = c("black", "chocolate", "steelblue4")) +
+  scale_y_continuous(limits = c(0, 1)) +
+  coord_cartesian(xlim = c(0, xmax)) +
+  geom_text(data = unique(eg.freq.dt[!is.na(total_indels), .(sgrna, total_indels)]), aes(label = total_indels), x = Inf, y = 0.9, hjust = 1) +
+  labs(x = "Distinct indel (position relative to cleavage site)",
+       y = "Indel frequency") +
+  theme_cowplot() + theme(legend.position = "none", axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+ggsave(p, filename=file.path(output.dir, "bottom3_top3.pdf"), width = 7, height = 2)
+ggsave(p, filename=file.path(output.dir, "bottom2_top2.pdf"), width = 8, height = 2)
+```
+

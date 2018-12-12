@@ -1,0 +1,202 @@
+---
+title: "CRISPR Indels Fig. 3"
+author: "A. M. Chakrabarti"
+date: "Last updated: 16th October 2018"
+output: 
+  html_notebook: 
+    code_folding: hide
+    fig_align: center
+    fig_height: 10
+    fig_width: 12
+    highlight: haddock
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE}
+library(data.table)
+library(ggplot2)
+library(rtracklayer)
+library(cowplot)
+library(ggthemes)
+library(scales)
+library(parallel)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(pheatmap)
+library(stringr)
+library(RColorBrewer)
+library(dunn.test)
+library(CrispRVariants)
+library(viridis)
+library(ggforce)
+library(ggsignif)
+
+setwd("~/Scaffidi/revisions/")
+output.dir <- "~/Scaffidi/revisions/plots/fig3"
+if(!dir.exists(output.dir)) dir.create(output.dir)
+
+```
+
+# A - Precision groups
+
+```{r}
+all.indels.gr <- readRDS("~/Scaffidi/revisions/all.indels.revised.gr.rds")
+
+indels.dt <- as.data.table(all.indels.gr)
+indels.dt[, indel_count := .N, by = .(seqnames, start, end, nt, sgrna)]
+indels.dt[, total_indels := .N, by = .(sgrna)]
+indels.dt[, indel_frequency := indel_count/total_indels]
+
+indels.dt[, max_indel_frequency := max(indel_frequency), by = sgrna]
+
+# Assign indel precision
+indels.dt[max_indel_frequency > 0 & max_indel_frequency <= 0.25, group := "I"]
+indels.dt[max_indel_frequency > 0.25 & max_indel_frequency <= 0.5, group := "M"]
+indels.dt[max_indel_frequency > 0.5 & max_indel_frequency <= 1, group := "P"]
+
+most.freq.dt <- unique(indels.dt[, .(sgrna, total_indels, max_indel_frequency, group)])
+
+ggplot(most.freq.dt[total_indels >= 10], aes(x = max_indel_frequency)) +
+  geom_rect(xmin = 0, xmax = 0.25, ymin = -Inf, ymax = Inf, fill = "#729ECE") +
+  annotate(geom = "text", label = most.freq.dt[total_indels >= 10, .N, by = group][group == "I"]$N, x = 0, y = Inf, hjust = -0.5, vjust = 2) +
+  geom_rect(xmin = 0.25, xmax = 0.5, ymin = -Inf, ymax = Inf, fill = "#FF9E4A") +
+  annotate(geom = "text", label = most.freq.dt[total_indels >= 10, .N, by = group][group == "M"]$N, x = 0.25, y = Inf, hjust = -0.5, vjust = 2) +
+  geom_rect(xmin = 0.5, xmax = 1, ymin = -Inf, ymax = Inf, fill = "#67BF5C") +
+  annotate(geom = "text", label = most.freq.dt[total_indels >= 10, .N, by = group][group == "P"]$N, x = 0.5, y = Inf, hjust = -0.5, vjust = 2) +
+  geom_histogram(binwidth = 0.05, boundary = 1, fill = "gray90", colour = "black", size = 1) +
+  scale_x_continuous(breaks = c(0.00, 0.25, 0.50, 0.75, 1.00)) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 100)) +
+  labs(# title = "Precision at targeted sites",
+       # subtitle = "Targets with at least 10 indel reads",
+       x = "Frequency of commonest indel",
+       y = "Number of targets") +
+  theme_cowplot()
+
+ggsave(file.path(output.dir, "precision_overview.pdf"), width = 5.5, height = 2.5)
+```
+
+# B -  Efficiency and precision
+
+```{r}
+pool.450.dt <- indels.dt[grepl("450", exp)]
+pool.450.dt[, count_450 := .N, by = sgrna]
+
+kruskal.test(list(I = pool.450.dt[count_450 >= 10][group == "I"]$count_450,
+               M = pool.450.dt[count_450 >= 10][group == "M"]$count_450,
+               P = pool.450.dt[count_450 >= 10][group == "P"]$count_450))
+
+res <- dunn.test(list(I = pool.450.dt[count_450 >= 10][group == "I"]$count_450,
+               M = pool.450.dt[count_450 >= 10][group == "M"]$count_450,
+               P = pool.450.dt[count_450 >= 10][group == "P"]$count_450),
+          method = "bh")
+
+min(pool.450.dt[count_450 >= 10 & group == "P"]$max_indel_frequency)
+
+ggplot(pool.450.dt[count_450 >= 10], aes(x = group, y = count_450, colour = group)) +
+  # geom_sina() +
+  geom_boxplot(width = 0.5, outlier.size = 1) +
+  # stat_compare_means(comparisons = list(c("I", "M"), c("M", "P"))) +
+  geom_signif(annotations = signif(c(res$P.adjusted[1], res$P.adjusted[3]), 3),
+              y_position = c(150, 200), xmin = c(1, 2), xmax = c(2, 3), colour = "black") +
+  scale_colour_tableau(palette = "Classic 10") +
+  # scale_y_log10(breaks = c(10, 50, 100, 500)) +
+  coord_cartesian(ylim = c(0, 200)) +
+  theme_cowplot() + theme(legend.position = "none") +
+  labs(# title = "Efficiency and precision",
+       # subtitle = "Targets with at least 10 indel reads",
+       y = "Indel count per target",
+       x = "Predictability group")
+
+ggsave(file.path(output.dir, "precision_efficiency.pdf"), width = 2.5, height = 2.5, units = "in")
+
+# setorder(pool.450.dt, -count_450)
+# unique(pool.450.dt[, .(sgrna, max_indel_frequency, count_450)])
+```
+
+# C - Precision and type of indel
+
+```{r}
+id.ratio.dt <- indels.dt[, .N, by = .(sgrna, indel, total_indels, max_indel_frequency, group)]
+id.ratio.dt[, ratio := N/total_indels]
+
+res<- dunn.test(list(I = id.ratio.dt[total_indels >= 10 & indel == "Insertion"][group == "I"]$ratio,
+               M = id.ratio.dt[total_indels >= 10 & indel == "Insertion"][group == "M"]$ratio,
+               P = id.ratio.dt[total_indels >= 10 & indel == "Insertion"][group == "P"]$ratio),
+          method = "bh")
+
+ggplot(id.ratio.dt[total_indels >= 10 & indel == "Insertion"], aes(x = group, y = ratio, colour = group)) +
+  geom_boxplot(width = 0.5) + geom_sina(shape = 1, size = 0.5, alpha = 0.5) +
+  geom_signif(annotations = signif(c(res$P.adjusted[1], res$P.adjusted[3]), 3),
+              y_position = c(0.9, 1), xmin = c(1, 2), xmax = c(2, 3), colour = "black") +
+  scale_colour_tableau(palette = "Classic 10") +
+  scale_y_continuous(label = percent) +
+  labs(# title = "Precision and type of indel",
+       x = "Predictability group",
+       y = "Percentage insertion rate",
+       colour = "Predictability group") +
+  coord_cartesian(ylim = c(0, 1)) +
+  theme_cowplot() + theme(legend.position = "none")
+
+# Fraction of P that prefer insertions
+nrow(id.ratio.dt[total_indels >= 10 & indel == "Insertion" & group == "P" & ratio > 0.5])/nrow(id.ratio.dt[total_indels >= 10 & indel == "Insertion" & group == "P"])
+
+ggsave(file.path(output.dir, "precision_insertionrate.pdf"), width = 2.5, height = 2.5, units = "in")
+```
+
+# D - Precision and indel size
+
+```{r}
+res <- dunn.test(list(I = abs(indels.dt[total_indels >= 10][group == "I"]$size),
+                      M = abs(indels.dt[total_indels >= 10][group == "M"]$size),
+                      P = abs(indels.dt[total_indels >= 10][group == "P"]$size)),
+               method = "bh")
+
+ggplot(indels.dt[total_indels >= 10], aes(x = group, y = abs(size), colour = group)) +
+  # geom_boxplot(width = 0.5, outlier.shape = NA) + geom_sina(size = 0.1, alpha = 0.1) +
+  geom_boxplot(width = 0.5, outlier.size = 0.5) +
+  geom_signif(annotations = signif(c(res$P.adjusted[1], res$P.adjusted[3]), 3),
+              y_position = c(3.7, 4.0), xmin = c(1, 2), xmax = c(2, 3), colour = "black") +
+  scale_y_log10(breaks = c(1, 10, 100, 1000, 10000)) +
+  scale_colour_tableau(palette= "Classic 10") +
+  labs(# title = "Precision and size of deletion",
+       x = "Predictability group",
+       y = "Absolute indel size",
+       colour = "Predictability group") +
+  theme_cowplot() + theme(legend.position = "none")
+
+indels.dt[total_indels >= 10, max(size)]
+indels.dt[total_indels >= 10, as.double(mean(abs(size))), by = group]
+
+# Fraction of P indels that are mononucleotide
+nrow(indels.dt[total_indels >= 10 & group == "P" & abs(size) == 1])/nrow(indels.dt[total_indels >= 10 & group == "P"])
+
+ggsave(file.path(output.dir, "precision_indel_size.pdf"), width = 2.75, height = 2.5, units = "in")
+```
+
+# E - Precision and indel size
+
+```{r}
+abs.median.indels.dt <- indels.dt[, median(as.double(abs(size))), by = .(sgrna, total_indels, max_indel_frequency, group)][total_indels >= 10, .(sgrna, max_indel_frequency, group, V1)]
+
+res <- dunn.test(list(I = abs.median.indels.dt[group == "I"]$V1,
+               M = abs.median.indels.dt[group == "M"]$V1,
+               P = abs.median.indels.dt[group == "P"]$V1),
+          method = "bh")
+
+ggplot(abs.median.indels.dt, aes(x = max_indel_frequency, y = V1)) +
+  geom_rect(xmin = 0, xmax = 0.25, ymin = -Inf, ymax = Inf, fill = "#729ECE") +
+  geom_rect(xmin = 0.25, xmax = 0.5, ymin = -Inf, ymax = Inf, fill = "#FF9E4A") +
+  geom_rect(xmin = 0.5, xmax = 1, ymin = -Inf, ymax = Inf, fill = "#67BF5C") +
+  geom_point(size = 1, alpha = 0.5) +
+  labs(x = "Frequency of commonest indel",
+       y = "Median absolute indel size per target") +
+  scale_x_continuous(breaks = c(0.00, 0.25, 0.5, 0.75, 1.00)) +
+  coord_cartesian(xlim = c(0, 1)) +
+  theme_cowplot()
+
+ggsave(file.path(output.dir, "median_absolute_indel_size.pdf"), width = 2.5, height = 2.5, units = "in")
+```
+

@@ -1,0 +1,303 @@
+---
+title: "CRISPR Indels Fig. 1"
+author: "A. M. Chakrabarti"
+date: "Last updated: 16th October 2018"
+output: 
+  html_notebook: 
+    code_folding: hide
+    fig_align: center
+    fig_height: 10
+    fig_width: 12
+    highlight: haddock
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE}
+library(data.table)
+library(ggplot2)
+library(rtracklayer)
+library(cowplot)
+library(ggthemes)
+library(scales)
+library(parallel)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(pheatmap)
+library(stringr)
+library(RColorBrewer)
+library(dunn.test)
+library(CrispRVariants)
+library(viridis)
+
+setwd("~/Scaffidi/revisions/")
+output.dir <- "~/Scaffidi/revisions/plots/fig1"
+if(!dir.exists(output.dir)) dir.create(output.dir)
+
+```
+
+# B - reproducibility
+
+```{r}
+all.indels.gr <- readRDS("~/Scaffidi/revisions/all.indels.revised.gr.rds")
+
+p450 <- all.indels.gr[grep("450-[0-9]P", all.indels.gr$exp)]
+p450.dt <- as.data.table(p450)
+p450.dt[, indel_count := .N, by = .(seqnames, start, end, nt, sgrna)]
+p450.dt[, total_indels := .N, by = .(sgrna)]
+p450.dt[, indel_frequency := indel_count/total_indels]
+p450.dt <- unique(p450.dt)
+
+t450 <- all.indels.gr[grep("450-[0-9]T", all.indels.gr$exp)]
+t450.dt <- as.data.table(t450)
+t450.dt[, indel_count := .N, by = .(seqnames, start, end, nt, sgrna)]
+t450.dt[, total_indels := .N, by = .(sgrna)]
+t450.dt[, indel_frequency := indel_count/total_indels]
+t450.dt <- unique(t450.dt)
+
+reprod.dt <- merge(p450.dt, t450.dt, by = c("seqnames", "start", "end", "width", "strand", "indel", "size", "nt", "sgrna"), all = TRUE)
+reprod.dt <- reprod.dt[sgrna != "NCOA6.7"]
+
+cor.test(reprod.dt[total_indels.x >=10 & total_indels.y >= 10]$indel_frequency.x, reprod.dt[total_indels.x >=10 & total_indels.y >= 10]$indel_frequency.y, method = "spearman", use = "complete.obs")
+
+ggplot(reprod.dt[total_indels.x >=10 & total_indels.y >= 10], aes(x = indel_frequency.x, y = indel_frequency.y)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", colour = "darkblue") +
+  scale_x_continuous(limits = c(0, 1)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  # coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(x = "Indel frequency (Replicate 1)", # P
+       y = "Indel frequency (Replicate 2)") + # T
+  annotate("text", x = 0.65, y = 0.01, label = paste0("Spearman's: ", round(cor(reprod.dt[total_indels.x >=10 & total_indels.y >= 10]$indel_frequency.x, reprod.dt[total_indels.x >=10 & total_indels.y >= 10]$indel_frequency.y, method = "spearman", use = "complete.obs"), 2))) +
+  theme_cowplot()
+
+ggsave(file.path(output.dir, "reproducibility.pdf"), width = 7, height = 7)
+
+```
+
+# C = Examples
+
+```{r}
+# Examples
+
+all.indels.gr <- readRDS("~/Scaffidi/revisions/all.indels.revised.gr.rds")
+all.indels.dt <- as.data.table(all.indels.gr)
+
+sgrna.dt <- fread("~/Dropbox (Lab)/CRISPR-indels/ref/sgrna.tsv")
+setnames(sgrna.dt, c("id", "strand", "cleavage_site"), c("sgrna", "sgrna_strand", "cleavage"))
+
+all.indels.dt <- merge(all.indels.dt, sgrna.dt[, .(sgrna, sgrna_strand, cleavage)], by = "sgrna")
+
+all.indels.dt[sgrna_strand == "+" & start < cleavage, indelid := start - cleavage]
+all.indels.dt[sgrna_strand == "+" & start >= cleavage, indelid := start - cleavage + 1]
+all.indels.dt[sgrna_strand == "-" & end > cleavage, indelid := cleavage - end]
+all.indels.dt[sgrna_strand == "-" & end <= cleavage, indelid := cleavage - end + 1]
+stopifnot(all(all.indels.dt$indelid != 0))
+all.indels.dt[, indelid := paste0(indelid, ":", width, str_sub(indel, 1, 1))]
+
+# Just 450s
+
+indels.450.dt <- all.indels.dt[grepl("450", exp)]
+indels.450.dt[, replicate := str_sub(exp, -1, -1)]
+indels.450.dt[, indel_count := .N, by = .(seqnames, start, end, nt, sgrna, replicate)]
+indels.450.dt[, total_indels := .N, by = .(sgrna, replicate)]
+indels.450.dt[, indel_frequency := indel_count/total_indels]
+indels.450.dt[, mean_freq := mean(indel_frequency), by = .(seqnames, start, end, nt, sgrna)]
+
+indels.450.dt <- unique(indels.450.dt[total_indels >= 10])
+stopifnot(all(indels.450.dt[, sum(indel_frequency), by = .(sgrna, replicate)]$V1 >= 0.999))
+indels.450.dt[replicate == "T", indel_frequency := -indel_frequency]
+
+indels.450.dt <- indels.450.dt[sgrna %in% reprod.dt$sgrna] # Get those in both from reprod.dt
+targets <- unique(indels.450.dt$sgrna) # 171 in both
+
+# if(!dir.exists("plots/reproducibility")) dir.create("plots/reproducibility")
+# 
+# for(target in targets) {
+# 
+#   p <- ggplot(indels.450.dt[sgrna == target], aes(x = reorder(indelid, mean_freq), y = indel_frequency, fill = replicate)) +
+#     geom_bar(stat = "identity") +
+#     labs(title = target, 
+#          y = "Indel frequency",
+#          x = "Indel", 
+#          fill = "Replicate") +
+#     scale_y_continuous(breaks = c(-1, 0, 1)) +
+#     coord_flip(ylim = c(-1, 1)) +
+#     scale_fill_manual(values = c("gold2", "black")) +
+#     theme_cowplot() # + theme(legend.position = "right", axis.text.x = element_text(angle = 45, hjust = 1))
+#   # p
+#   
+#   ggsave(p, filename = paste0("plots/reproducibility/", target, "_reprod.pdf"), width = 4, height = 6, units = "in")
+# 
+# }
+
+for(target in c("ATAD2B.6", "CDYL.5", "PRMT1.7")) {
+
+  indels.450.dt[indel_frequency < 0, ycoord := -0.95]
+  indels.450.dt[indel_frequency > 0, ycoord := 0.95]
+  ggplot(indels.450.dt[sgrna == target], aes(x = reorder(indelid, mean_freq), y = indel_frequency, fill = replicate)) +
+      geom_bar(stat = "identity") +
+      geom_text(aes(x = reorder(indelid, mean_freq), y = ycoord, label = round(abs(indel_frequency), 2), colour = replicate)) +
+      labs(title = target, 
+           y = "Indel frequency",
+           x = "Indel", 
+           fill = "Replicate") +
+      scale_y_continuous(breaks = c(-1, 0, 1)) +
+      coord_flip(ylim = c(-1, 1)) +
+      scale_fill_manual(values = c("gold2", "black")) +
+      scale_colour_manual(values = c("gold2", "black")) +
+      theme_cowplot() + theme(legend.position = "none")
+  
+  ggsave(file.path(output.dir, paste0(target, ".pdf")), width = 3, height = 3, units = "in")
+
+}
+
+```
+
+
+# D - Size of commonest indel
+
+```{r}
+all.indels.gr <- readRDS("~/Scaffidi/revisions/all.indels.revised.gr.rds")
+indels.dt <- as.data.table(all.indels.gr)
+indels.dt[, indel_count := .N, by = .(seqnames, start, end, nt, sgrna)]
+indels.dt[, total_indels := .N, by = .(sgrna)]
+indels.dt[, indel_frequency := indel_count/total_indels]
+indels.dt[, max_indel_frequency := max(indel_frequency), by = sgrna]
+
+res.threshold.dt <- indels.dt[total_indels >= 10]
+setorder(res.threshold.dt, sgrna, -indel_frequency, size)
+res.threshold.commonest.dt <- unique(res.threshold.dt[indel_frequency == max_indel_frequency], by = "sgrna") # if ties, take shortest
+
+ggplot(res.threshold.commonest.dt, aes(x = -size)) +
+  geom_bar() +
+  labs(x = "Commonest indel size",
+       y = "Number of targets") +
+  theme_cowplot()
+
+ggsave(file.path(output.dir, "size_of_commonest.pdf"), width = 7, height = 5)
+```
+
+```{r}
+nrow(res.threshold.commonest.dt[size == 1])/nrow(res.threshold.commonest.dt)
+nrow(res.threshold.commonest.dt[size == -1])/nrow(res.threshold.commonest.dt)
+```
+
+
+# E - Frameshift
+
+Barplot
+
+```{r}
+all.indels.gr <- readRDS("~/Scaffidi/revisions/all.indels.revised.gr.rds")
+indels.dt <- as.data.table(all.indels.gr)[, exp := NULL]
+
+indels.dt[size %% 3 == 0, frameshift := FALSE]
+indels.dt[size %% 3 != 0, frameshift := TRUE]
+indels.dt[, total_indels := .N, by = .(sgrna)]
+
+frameshift.dt <- indels.dt[total_indels >= 10, .N, by = .(sgrna, frameshift, total_indels)]
+frameshift.dt[, fraction := N/total_indels]
+
+ggplot(frameshift.dt[frameshift == "TRUE"], aes(x = reorder(sgrna, fraction), y = fraction)) +
+  geom_bar(stat = "identity", width = 1, fill = "#003b46") +
+  labs(x = "Targets",
+       y = "Percentage of frameshift indels") +
+  geom_hline(yintercept = mean(frameshift.dt[frameshift == "TRUE"]$fraction), linetype = "dashed", colour = "black") +
+  annotate("text", x = 0, y = 0.85, label = "Mean percentage", hjust = -0.1) +
+  scale_x_discrete(labels = NULL) +
+  scale_y_continuous(labels = percent) +
+  theme_cowplot() + theme(axis.line.x = element_blank(), axis.ticks.x = element_blank())
+
+ggsave(file.path(output.dir, "frameshift.pdf"), width = 9, height = 3.5, units = "in")
+```
+
+```{r}
+mean(frameshift.dt[frameshift == "TRUE"]$fraction)
+```
+
+
+Inset pie chart
+
+```{r}
+ggplot(indels.dt[, .N, by = frameshift], aes(x = factor(1), y = N, fill = factor(frameshift))) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y") +
+  scale_fill_manual(values = c("#c4dfe6", "#003b46"), labels = c("No frameshift", "Frameshift")) + # show_col(canva_pal("Cool blues")(4))
+  # labs(title = "Overall proportion of frameshift indels",
+  #      fill = "") +
+  theme_cowplot() +
+  theme(axis.text = element_blank(), axis.title = element_blank(), panel.border = element_blank(), panel.grid = element_blank(), axis.ticks = element_blank(), axis.line = element_blank(), legend.position = "none")
+
+ggsave(file.path(output.dir, "frameshift_overview.pdf"), width = 7, height = 7, units = "in")
+```
+
+```{r}
+indels.dt[, .N, by = frameshift][frameshift == TRUE]$N/sum(indels.dt[, .N, by = frameshift]$N)
+```
+
+
+How often is the commonest a frameshift?
+
+```{r}
+res.threshold.commonest.dt[size %% 3 == 0, frameshift := FALSE]
+res.threshold.commonest.dt[size %% 3 != 0, frameshift := TRUE]
+
+table(res.threshold.commonest.dt$frameshift)
+
+print(nrow(res.threshold.commonest.dt[frameshift == TRUE])/nrow(res.threshold.commonest.dt))
+```
+# F - Heatmap
+
+This is for 450 experiments only
+
+```{r}
+all.indels.gr <- readRDS("~/Scaffidi/revisions/all.indels.revised.gr.rds")
+indels.dt <- as.data.table(all.indels.gr)[grepl("450", exp)]
+
+freq <- indels.dt[, indelreads_by_sgrna := .N, by = sgrna][indelreads_by_sgrna >= 10]
+
+bins <- c(-Inf, -2, 0:10, Inf)
+freq$bin <- cut(freq$size, bins, labels = FALSE)
+
+freq <- freq[, number_of_indelreads_for_each_indel := .N, by= .(sgrna, bin)]
+freq <- unique(freq, by = c("sgrna", "bin")) # NB data.table has changed this in the recent update so does not do by key but need to specify.
+freq <- freq[, fraction := number_of_indelreads_for_each_indel/indelreads_by_sgrna]
+
+bin_labels <- gsub("\\(|\\]", "", levels(cut(freq$size, bins)))
+
+target <- unique(freq$sgrna)
+mat <- matrix(nrow = max(freq$bin), ncol = length(target))
+
+for(i in 1:length(target)) {
+  data_subset <- freq[sgrna == target[i]]
+  for(j in 1:nrow(data_subset)) {
+    mat[data_subset$bin[j], i] <- data_subset$fraction[j] # this only works because the bin is numeric
+  }
+}
+
+mat[is.na(mat)] <- 0
+colnames(mat) <- target
+rownames(mat) <- c("Ins >1", "Ins 1", 1:10, ">10")
+
+hc <- hclust(dist(t(mat)), method = "ward.D2")
+
+pheatmap(mat, cluster_rows = FALSE, cluster_cols = hc, border_color = NA, color = c("grey85", colorRampPalette(brewer.pal(n = 9, name = "Blues"))(100)), show_colnames = FALSE, show_rownames = TRUE, filename = file.path(output.dir, "size_heatmap.pdf"), width = 10, height = 3)
+```
+
+Ordered barplot across top of heatmap
+
+```{r}
+ggplot(unique(freq[, .(sgrna, indelreads_by_sgrna)]), aes(x = reorder(sgrna, hc$order), y = indelreads_by_sgrna)) +
+  geom_bar(stat = "identity", width = 1) +
+  scale_y_log10() +
+  labs(title = "Frequency of sizes of indels",
+       y = "Indel count",
+       x = "") +
+  scale_x_discrete(labels = NULL) + theme(axis.ticks.x = element_blank(), axis.line.x = element_blank(), axis.text.x = element_text(size = 1))
+
+ggsave(file.path(output.dir, "heatmaps_bincounts.pdf"), width = 10, height = 1.5, units = "in")
+```
+

@@ -1,0 +1,183 @@
+---
+title: "CRISPR Indels Fig. 7 and S7"
+author: "A. M. Chakrabarti"
+date: "Last updated: 16th October 2018"
+output: 
+  html_notebook: 
+    code_folding: hide
+    fig_align: center
+    fig_height: 10
+    fig_width: 12
+    highlight: haddock
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE}
+library(data.table)
+library(ggplot2)
+library(rtracklayer)
+library(cowplot)
+library(ggthemes)
+library(scales)
+library(parallel)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(pheatmap)
+library(stringr)
+library(RColorBrewer)
+library(dunn.test)
+library(CrispRVariants)
+library(viridis)
+library(ggforce)
+library(ggseqlogo)
+library(genomation)
+library(ggsci)
+
+setwd("~/Scaffidi/revisions/")
+output.dir <- "~/Scaffidi/revisions/plots/fig7"
+source("~/Github/crispr-indels/functions.R")
+if(!dir.exists(output.dir)) dir.create(output.dir)
+
+```
+
+```{r}
+sgrna.targets <- c("ACTL6A.5", "ASF1B.7", "BRD2.7", "MBD3L1.6", "MSH6.2", "SMARCD2.1")
+cv.list <- readRDS("~/Scaffidi/validation/cv.list.rds")
+names(cv.list) <- sgrna.targets
+```
+
+# Normalise by all indels
+
+```{r}
+# ==========
+# Function to calculate total normalisation factor
+
+CalculateTotalNorm <- function(mat) {
+  
+  norm_factor <- colSums(mat)
+    # return(norm_factor/mean(norm_factor))
+  return(norm_factor)
+  
+}
+
+# ==========
+# Function to normalise CrispRVariants list
+
+NormaliseCV <- function(CV.list, normalisation.method = c("Raw", "DESeq", "TMM", "Quantile", "Total"), quant = 0.9) {
+  
+  norm.vc.list <- lapply(1:length(CV.list), function(i) {
+    
+  # Get variant counts
+  message(names(CV.list[i]))
+  cv <- CV.list[[i]]
+  vc <- variantCounts(cv, include.nonindel = FALSE)
+  
+  # Remove failed experiment if present
+  if(names(cv.list)[i] == "SMARCD2.1") vc <- vc[, colnames(vc) != "SETD2_KO_RepA"] 
+  
+  # Get size factors
+  if(normalisation.method == "DESeq") {
+    norm.factors <- DESeq2::estimateSizeFactorsForMatrix(vc)
+  } else if(normalisation.method == "TMM") {
+    norm.factors <- edgeR::calcNormFactors(vc, method = "TMM")
+  } else if(normalisation.method == "Quantile") {
+    norm.factors <- EBSeq::QuantileNorm(vc, quant)
+  } else if(normalisation.method == "Total") {
+    norm.factors <- CalculateTotalNorm(vc)
+  } else if(normalisation.method == "Raw") {
+    norm.factors <- 1
+  } else {
+    stop("Normalisation method not supported.")
+  }
+    
+  # Divide the two by row
+  norm.vc <- sweep(vc, MARGIN = 2, norm.factors, `/`)
+  
+  return(norm.vc)
+  
+  })
+  
+  return(norm.vc.list)
+  
+}
+
+total.norm.vc.list <- NormaliseCV(CV.list = cv.list, normalisation.method = "Total")
+names(total.norm.vc.list) <- names(cv.list)
+```
+
+# A - Indel change
+
+```{r}
+rank.list <- lapply(sgrna.targets, function(target) {
+
+profile.dt <- melt.data.table(data.table(total.norm.vc.list[[which(names(total.norm.vc.list) == target)]], keep.rownames = TRUE)[1:10, .(rn, NT_0_RepA, NT_0_RepB, TSA_11nM_RepA, TSA_11nM_RepB, TSA_100nM_RepA, TSA_100nM_RepB)], id.vars = "rn")
+profile.dt[, start_coord := as.integer(sapply(strsplit(rn, "\\:"), "[[", 1))][, size := as.integer(gsub("I|D", "", sapply(strsplit(rn, "\\:"), "[[", 2)))]
+profile.dt[, drug := sapply(strsplit(as.character(variable), "_"), "[[", 1)][, dose := sapply(strsplit(as.character(variable), "_"), "[[", 2)][, rep := sapply(strsplit(as.character(variable), "_"), "[[", 3)]
+
+rank.dt <- profile.dt[grepl("NT", variable), mean(value), by = rn]
+setorder(rank.dt, -V1)
+rank.dt[, indelrank := 1:.N]
+
+profile.dt[grepl("RepA", variable), value := -value]
+profile.dt$dose <- factor(profile.dt$dose, levels = c("0", "11nM", "100nM"))
+profile.dt <- merge(profile.dt, rank.dt, by = "rn")
+profile.dt[, fct := paste0(drug, "-", dose)]
+profile.dt$fct <- factor(profile.dt$fct, levels = c("NT-0", "TSA-11nM", "TSA-100nM"))
+
+p <- ggplot() +
+  geom_bar(data = profile.dt[dose == "0"], aes(x = reorder(rn, -indelrank), y = value), fill = "grey75", stat = "identity", position = "dodge", colour = NA) +
+  geom_bar(data = profile.dt[dose == "100nM"], aes(x = reorder(rn, -indelrank), y = value), fill = NA, stat = "identity", position = "dodge", colour = "#de2d26", size = 1) +
+  geom_hline(yintercept = 0) +
+  # scale_y_continuous(breaks = c(-4, 0, 4), labels = c("4", "0", "4")) +
+  # scale_fill_manual(values = c("grey50", "#fee0d2", "#de2d26")) +
+  # scale_fill_manual(values = c("grey50", "#de2d26")) +
+  # facet_grid(. ~ drug) +
+  labs(y = "Normalised count",
+       x = "Indel") +
+    coord_flip(ylim = c(-max(abs(profile.dt$value)), max(abs(profile.dt$value)))) +
+  theme_cowplot() + theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(p, filename = paste0(output.dir, "/", target, "_indelchange_f6_tsa100_box_new.pdf"), width = 4, height = 6)
+
+return(rank.dt)
+
+})
+
+names(rank.list) <- sgrna.targets
+```
+
+# C - Top 3 indels
+
+```{r}
+tsa.list <- lapply(total.norm.vc.list, function(x) data.table(x[1:3, c("NT_0_RepA", "NT_0_RepB", "TSA_100nM_RepA", "TSA_100nM_RepB", "TSA_11nM_RepA", "TSA_11nM_RepB")], keep.rownames = TRUE))
+tsa.dt <- rbindlist(tsa.list)
+tsa.dt$sgrna <- rep(names(tsa.list), elementNROWS(tsa.list))
+tsa.dt[, indelrank := 1:.N, by = sgrna]
+tsa.melted.dt <- melt.data.table(tsa.dt, id.vars = c("sgrna", "rn", "indelrank"))
+tsa.melted.dt[, drug := sapply(strsplit(as.character(variable), "_"), "[[", 1)][, dose := sapply(strsplit(as.character(variable), "_"), "[[", 2)][, rep := sapply(strsplit(as.character(variable), "_"), "[[", 3)]
+
+tsa.melted.dt[dose == 0, fakescale := 1][dose == "11nM", fakescale := 2][dose == "100nM", fakescale := 3]
+tsa.melted.dt[, m := mean(value), by = .(sgrna, rn, drug, dose)][, sd := sd(value), by = .(sgrna, rn, drug, dose)]
+
+ggplot(tsa.melted.dt, aes(x = fakescale, y = value, colour = factor(indelrank), fill = factor(indelrank))) +
+  geom_ribbon(aes(ymin = m - sd, ymax = m + sd), alpha = 0.25, size = 0) +
+  geom_point(aes(shape = factor(indelrank)), colour = "black", size = 2) +
+  geom_line(stat = "summary", fun.y = "mean", size = 1) +
+  facet_wrap(~ sgrna, scales = "free_y") +
+  scale_x_continuous(breaks = c(1, 2, 3), labels = c("NT", "TSA 11nM", "TSA 100nM")) +
+  scale_shape_discrete(label = c("Rank 1", "Rank 2", "Rank 3")) +
+  scale_fill_economist(label = c("Rank 1", "Rank 2", "Rank 3")) +
+  scale_colour_economist(label = c("Rank 1", "Rank 2", "Rank 3")) +
+  labs(x = "Condition",
+       y = "Normalised frequency",
+       fill = "", 
+       colour = "",
+       shape = "") +
+  theme_cowplot() + theme(legend.position = "bottom", axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(output.dir, "top3_relative_indel_count_new.pdf"), width = 8, height = 6)
+
+```

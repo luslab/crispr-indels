@@ -1,0 +1,356 @@
+---
+title: "CRISPR Indels Fig. 6"
+author: "A. M. Chakrabarti"
+date: "Last updated: 16th October 2018"
+output: 
+  html_notebook: 
+    code_folding: hide
+    fig_align: center
+    fig_height: 10
+    fig_width: 12
+    highlight: haddock
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE}
+library(data.table)
+library(ggplot2)
+library(rtracklayer)
+library(cowplot)
+library(ggthemes)
+library(scales)
+library(parallel)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(pheatmap)
+library(stringr)
+library(RColorBrewer)
+library(dunn.test)
+library(CrispRVariants)
+library(viridis)
+library(ggforce)
+library(ggseqlogo)
+library(genomation)
+
+setwd("~/Scaffidi/revisions/")
+output.dir <- "~/Scaffidi/revisions/plots/fig6"
+source("~/Github/crispr-indels/functions.R")
+if(!dir.exists(output.dir)) dir.create(output.dir)
+
+```
+
+```{r}
+sgrna.targets <- c("ACTL6A.5", "ASF1B.7", "BRD2.7", "MBD3L1.6", "MSH6.2", "SMARCD2.1")
+cv.list <- readRDS("~/Scaffidi/validation/cv.list.rds")
+```
+
+# A - Indel profiles
+
+```{r}
+names(cv.list) <- sgrna.targets
+
+total.norm.vc.list <- lapply(cv.list, function(x) variantCounts(x, result = "proportions", include.nonindel= FALSE))
+names(total.norm.vc.list) <- names(cv.list)
+
+indels.list <- lapply(1:length(sgrna.targets), function(i) {
+  
+  message(i)
+  message(sgrna.targets[i])
+  
+  nt <- melt.data.table(data.table(total.norm.vc.list[[i]], keep.rownames = TRUE)[1:100][, .(rn, NT_0_RepA, NT_0_RepB)], id.vars = "rn")
+  if(any(str_count(nt$rn, ":") > 1)) nt[str_count(rn, ":") > 1, closest_indelname := GetClosestIndelSize(rn), by = rn]
+  nt[str_count(rn, ":") == 1, closest_indelname := rn]
+  nt[, coord := as.integer(sapply(strsplit(closest_indelname, "\\:"), "[[", 1))]
+  
+  nt <- nt[, mean(value), by = .(rn, coord)]
+  nt <- rbind(nt, list(rn = "0:0", coord = 0, V1 = Inf))
+  nt[rn == "0:0", col := "A"]
+  nt[rn != "0:0", col := "B"]
+  
+  setorder(nt, coord, V1)
+  nt[coord <= 0, rank := 1:.N]
+  max_rank_so_far <- max(nt$rank[!is.na(nt$rank)])
+  distinct_indel_count <- nrow(nt)
+  setorder(nt, coord, -V1)
+  nt[coord > 0, rank := (max_rank_so_far + 1):distinct_indel_count]
+  setorder(nt, rank)
+  stopifnot(all(nt[, diff(rank)] == 1))
+  
+  p <- ggplot(nt, aes(x = reorder(rn, rank), y = V1)) +
+    # geom_bar(stat = "identity", fill = "grey50", colour = NA) +
+    geom_bar(stat = "identity", aes(fill = col), colour = NA) +
+    scale_fill_manual(values = c("black", "grey50")) +
+    labs(x = "",
+         y = "",
+         title = sgrna.targets[i]) +
+    # coord_flip() +
+    theme_cowplot() + theme(legend.position = "none", axis.title.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank())
+  
+  ggsave(plot = p, filename = paste0(output.dir, "/indel_profile_", sgrna.targets[i], ".pdf"), width = 1.75, height = 2)
+  
+  return(p)
+  
+})
+
+# plot_grid(plotlist = indels.list, nrow = 1, align = "h")
+ggsave(plot_grid(plotlist = indels.list, nrow = 1, align = "h"), filename = file.path(output.dir, "indel_description.pdf"), height = 2, width = 8)
+```
+# B - Mutation efficiency
+
+```{r}
+# Mutation efficiency
+names(cv.list) <- sgrna.targets
+
+eff.list <- lapply(1:length(cv.list), function(x) {
+  
+  eff <- as.data.frame(mutationEfficiency(cv.list[[x]], snv = "non_variant"))
+  colnames(eff) <- names(cv.list)[x]
+  
+  return(eff)
+
+})
+
+eff.dt <- cbind(eff.list[[1]], eff.list[[2]], eff.list[[3]], eff.list[[4]], eff.list[[5]], eff.list[[6]])
+eff.dt <- eff.dt[1:16, ]
+eff.dt$exp <- rownames(eff.dt)
+eff.dt <- data.table(eff.dt)
+eff.dt <- eff.dt[grepl("EZHi_0.3uM|EZHi_3uM|NT_0|TSA_11nM|TSA_100nM", exp)]
+eff.melted.dt <- melt.data.table(eff.dt, id.vars = "exp")
+eff.melted.dt[, drug := sapply(strsplit(exp, "_"), "[[", 1)][, dose := sapply(strsplit(exp, "_"), "[[", 2)][, grp := paste0(drug, "-", dose)]
+eff.melted.dt$grp <- factor(eff.melted.dt$grp, levels = c("NT-0", "EZHi-0.3uM", "EZHi-3uM", "TSA-11nM", "TSA-100nM"))
+eff.melted.dt$drug <- factor(eff.melted.dt$drug, levels = c("NT", "EZHi", "TSA"))
+eff.melted.dt[, rep := sapply(strsplit(exp, "_"), "[[", 3)]
+
+p.eff <- ggplot(eff.melted.dt, aes(x = grp, y = value, fill = drug, group = rep)) +
+  # geom_bar(stat = "summary", fun.y = "mean", width = 0.5, colour = "black") +
+  geom_bar(stat = "identity", width = 0.9, colour = "black", position = "dodge") +
+  scale_fill_manual(values = c("#A2A2A2", "#3182bd", "#de2d26")) +
+  facet_wrap(~ variable, nrow = 1) +
+  labs(x = "Condition",
+       y = "Mean efficiency (%)",
+       fill = "Condition") +
+  # scale_fill_brewer(palette = "Dark2") +
+  theme_cowplot() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), legend.position = "none")
+
+# Fold change
+eff.avg.dt <- eff.melted.dt[, mean(value), by = .(variable, drug, dose, grp)]
+setnames(eff.avg.dt, "V1", "mean_eff")
+
+eff.avg.mat <- as.matrix(dcast.data.table(eff.avg.dt[, exp := paste0(drug, "_", dose)], variable ~ grp, value.var = "mean_eff")[, 2:6])
+rownames(eff.avg.mat) <- dcast.data.table(eff.avg.dt[, exp := paste0(drug, "_", dose)], variable ~ grp, value.var = "mean_eff")$variable
+
+# Calculate fold change
+control <- eff.avg.mat[, "NT-0"]
+eff.fc.mat <- apply(eff.avg.mat, 2, function(x) x/control)
+eff.fc.mat <- log2(eff.fc.mat)
+
+# Get back to data.table format for plotting
+eff.fc.dt <- data.table(eff.fc.mat)
+eff.fc.dt[, target := rownames(eff.fc.mat)]
+eff.fc.dt <- melt.data.table(eff.fc.dt, id.vars = "target")
+# eff.fc.dt <- eff.fc.dt[variable != "NT-0"]
+
+eff.fc.dt$variable <- as.character(eff.fc.dt$variable)
+eff.fc.dt[, drug := sapply(strsplit(variable, "\\-"), "[[", 1)][, dose := sapply(strsplit(variable, "\\-"), "[[", 2)]
+eff.fc.dt$dose <- factor(eff.fc.dt$dose, levels = c("0.3uM", "3uM", "11nM", "100nM"))
+eff.fc.dt$variable <- factor(eff.fc.dt$variable, levels = c("NT-0", "EZHi-0.3uM", "EZHi-3uM", "TSA-11nM", "TSA-100nM"))
+
+eff.fc.dt[variable == "NT-0", value := NA]
+
+p.fc <- ggplot(eff.fc.dt, aes(x = variable, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge", colour = "black", width = 0.9) +
+  scale_fill_manual(values = c("white", "#deebf7", "#3182bd", "#fee0d2", "#de2d26")) +
+  facet_wrap(~ target, nrow = 1) +
+  # coord_flip() +
+  labs(x = "Condition",
+       y = "Log2 fold change in mean efficiency",
+       fill = "Condition") +
+  theme_cowplot() + theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none", strip.background = element_blank(), strip.text.x = element_blank())
+
+# ggsave("plots/chromation_efficiency_l2fc_facet.pdf", width = 15, height = 5)
+
+ggsave(plot = plot_grid(p.eff, p.fc, nrow = 2, align = "v"), filename = file.path(output.dir, "chromatin_efficiency_and_fold_change.pdf"), height = 8, width = 21)
+```
+# C - Chromatin
+
+```{r}
+sgrna.dt <- fread("~/Dropbox (Lab)/CRISPR-indels/ref/sgrna.tsv")
+setnames(sgrna.dt, "id", "sgrna")
+
+sgrna.sel.dt <- sgrna.dt[sgrna %in% sgrna.targets]
+sgrna.histone.dt <- melt.data.table(sgrna.sel.dt[, .(sgrna, DNase, H3K27ac, H3K9ac)], id.vars = "sgrna")
+sgrna.histone.dt[, mean_signal := mean(value), by = variable][, max_signal := max(value), by = variable]
+sgrna.histone.dt[, mean_normalised := value/mean_signal][, max_normalised := value/max_signal]
+
+
+ggplot(sgrna.histone.dt, aes(x = sgrna, y = value)) +
+  geom_bar(stat = "identity", width = 0.6, colour = "grey50") +
+  facet_grid(variable ~ .) +
+  labs(x = "Target",
+       y = "Mean histone signal over cleavage site ± 250 nt ")
+
+ggplot(sgrna.histone.dt, aes(x = sgrna, y = variable, fill = mean_normalised)) +
+  geom_tile() +
+  scale_fill_viridis() +
+  labs(x = "Target",
+       fill = "Normalised mean signal",
+       y = "Histone")+
+  theme_cowplot() + theme(legend.position = "top")
+
+ggsave(filename = file.path(output.dir, "histone.pdf"), height = 2, width = 9)
+
+```
+
+# D - Indel Fold change
+
+```{r}
+avg.fc.list <- lapply(1:length(total.norm.vc.list), function(i) {
+  
+  # message(names(total.norm.vc.list)[i])
+  # Get VC table
+  vc.dt <- data.table(total.norm.vc.list[[i]])
+  vc.dt <- vc.dt[, .(NT_0_RepA, NT_0_RepB, EZHi_0.3uM_RepA, EZHi_0.3uM_RepB, EZHi_3uM_RepA, EZHi_3uM_RepB, TSA_11nM_RepA, TSA_11nM_RepB, TSA_100nM_RepA, TSA_100nM_RepB)] # Just keep conditions of interest
+  
+  # Filter by read threshold
+  threshold <- 1
+  passing_rows <- apply(vc.dt, 1, function(row) any(row > threshold))
+  vc.dt$indel <- rownames(total.norm.vc.list[[i]])
+  vc.dt <- vc.dt[passing_rows]
+  
+  vc.dt <- melt.data.table(vc.dt, id.vars = "indel")
+  setnames(vc.dt, c("indel", "exp", "count"))
+  vc.dt$exp <- as.character(vc.dt$exp)
+  vc.dt[, drug := sapply(strsplit(exp, "_"), "[[", 1)][, dose := sapply(strsplit(exp, "_"), "[[", 2)][, rep := sapply(strsplit(exp, "_"), "[[", 3)]
+  vc.dt[, exp := paste0(drug, "_", dose)]
+  # Get average across replicates
+  avg.vc <- vc.dt[, .(avg_count = median(count)), by = .(indel, exp, drug, dose)]
+  
+  # Convert to matrix
+  avg.vc.mat <- as.matrix(dcast.data.table(avg.vc[, exp := paste0(drug, "_", dose)], indel ~ exp, value.var = "avg_count")[, 2:6, ])
+  rownames(avg.vc.mat) <- dcast.data.table(avg.vc[, exp := paste0(drug, "_", dose)], indel ~ exp, value.var = "avg_count")$indel
+  
+  # Calculate fold change
+  control <- sort(avg.vc.mat[, "NT_0"], decreasing = TRUE)
+  
+  # Not mean
+  vc.dt <- data.table(total.norm.vc.list[[i]])
+  vc.dt <- vc.dt[, .(NT_0_RepA, NT_0_RepB, EZHi_0.3uM_RepA, EZHi_0.3uM_RepB, EZHi_3uM_RepA, EZHi_3uM_RepB, TSA_11nM_RepA, TSA_11nM_RepB, TSA_100nM_RepA, TSA_100nM_RepB)] # Just keep conditions of interest
+  
+  # Filter by read threshold
+  threshold <- 1
+  passing_rows <- apply(vc.dt, 1, function(row) any(row > threshold))
+  vc.dt$indel <- rownames(total.norm.vc.list[[i]])
+  vc.dt <- vc.dt[passing_rows]
+  vc.mat <- as.matrix(vc.dt[, 3:10, ])
+  rownames(vc.mat) <- vc.dt$indel
+  vc.mat <- vc.mat[match(rownames(vc.mat), names(control)), ] # make sure same order
+  
+  vc.fc <- apply(vc.mat, 2, function(x) x/control)
+  vc.fc <- log2(vc.fc) # log2 transform to make symmetrical
+
+  # Get back to data.table format for plotting
+  vc.fc.dt <- data.table(vc.fc)
+  vc.fc.dt[, indel := rownames(vc.fc)]
+  vc.fc.dt <- melt.data.table(vc.fc.dt, id.vars = "indel")
+  setnames(vc.fc.dt, c("indel", "exp", "l2fc"))
+ 
+  # Add in normalised count
+  # results.dt <- merge(vc.fc.dt, avg.vc[, .(indel, exp, avg_count)], by = c("indel", "exp"))
+  
+  return(vc.fc.dt)
+   
+})
+
+avg.fc.dt <- rbindlist(avg.fc.list)
+avg.fc.dt[, sgrna := rep(names(cv.list), elementNROWS(avg.fc.list))]
+
+avg.fc.dt$exp <- as.character(avg.fc.dt$exp)
+avg.fc.dt[, drug := sapply(strsplit(exp, "_"), "[[", 1)][, dose := sapply(strsplit(exp, "_"), "[[", 2)]
+avg.fc.dt$dose <- factor(avg.fc.dt$dose, levels = c("0.3uM", "3uM", "11nM", "100nM"))
+```
+
+```{r}
+nt.fc.list <- lapply(1:length(total.norm.vc.list), function(i) {
+  
+  # message(names(total.norm.vc.list)[i])
+  # Get VC table
+  vc.dt <- data.table(total.norm.vc.list[[i]])
+  vc.dt <- vc.dt[, .(NT_0_RepA, NT_0_RepB, EZHi_0.3uM_RepA, EZHi_0.3uM_RepB, EZHi_3uM_RepA, EZHi_3uM_RepB, TSA_11nM_RepA, TSA_11nM_RepB, TSA_100nM_RepA, TSA_100nM_RepB)] # Just keep conditions of interest
+  
+  # Filter by read threshold
+  # threshold <- min(colSums(vc.dt)) * 0.01 # Contributes at least 1% of total
+  threshold <- 1
+  passing_rows <- apply(vc.dt, 1, function(row) any(row > threshold))
+  vc.dt$indel <- rownames(total.norm.vc.list[[i]])
+  vc.dt <- vc.dt[passing_rows]
+  
+  vc.dt <- melt.data.table(vc.dt, id.vars = "indel")
+  setnames(vc.dt, c("indel", "exp", "count"))
+  vc.dt$exp <- as.character(vc.dt$exp)
+  vc.dt[, drug := sapply(strsplit(exp, "_"), "[[", 1)][, dose := sapply(strsplit(exp, "_"), "[[", 2)][, rep := sapply(strsplit(exp, "_"), "[[", 3)]
+  vc.dt[, exp := paste0(drug, "_", dose)]
+  # Get average across replicates
+  avg.vc <- vc.dt[, .(avg_count = median(count)), by = .(indel, exp, drug, dose)]
+
+  
+  # return(avg.vc[drug == "NT"])
+  return(vc.dt[drug == "NT"])
+   
+})
+
+nt.fc.dt <- rbindlist(nt.fc.list)
+nt.fc.dt[, sgrna := rep(names(cv.list), elementNROWS(nt.fc.list))]
+nt.fc.dt[, avg_count := mean(count), by = .(sgrna, indel, exp, drug, dose)]
+# setorder(nt.fc.dt, -avg_count)
+# setnames(nt.fc.dt, "avg_count", "nt_count")
+
+avg.nt.fc.dt <- unique(nt.fc.dt[, .(indel, sgrna, avg_count)])
+setorder(avg.nt.fc.dt, -avg_count)
+avg.nt.fc.dt[, indelrank := 1:.N, by = sgrna]
+
+nt.fc.dt <- merge(nt.fc.dt, avg.nt.fc.dt[, .(sgrna, indel, indelrank)], by = c("indel", "sgrna"))
+
+# avg.fc.dt <- merge(avg.fc.dt, nt.fc.dt[, .(indel, sgrna, nt_count)], by = c("indel", "sgrna"))
+# avg.fc.dt <- merge(avg.fc.dt, mh.dt, by = c("sgrna", "indel"))
+# nt.fc.dt <- merge(nt.fc.dt, mh.dt, by = c("sgrna", "indel"))
+avg.fc.dt <- merge(avg.fc.dt, avg.nt.fc.dt[, .(sgrna, indel, indelrank)], by = c("indel", "sgrna"))
+
+avg.fc.dt[, indeltype := str_sub(indel, -1)]
+avg.fc.dt[, rep := sapply(strsplit(exp, "_"), "[[", 3)][, grp := paste0(dose, "_", rep)]
+avg.fc.dt$grp <- factor(avg.fc.dt$grp, levels = c("0.3uM_RepA", "0.3uM_RepB", "3uM_RepA", "3uM_RepB", "11nM_RepA", "11nM_RepB", "100nM_RepA", "100nM_RepB"))
+nt.fc.dt[, indeltype := str_sub(indel, -1)][, grp := paste0(dose, "_", rep)]
+nt.fc.dt$grp <- factor(nt.fc.dt$grp, levels = c("0.3uM_RepA", "0.3uM_RepB", "3uM_RepA", "3uM_RepB", "11nM_RepA", "11nM_RepB", "100nM_RepA", "100nM_RepB"))
+
+for(target in sgrna.targets) {
+
+    p1 <- ggplot(nt.fc.dt[sgrna == target], aes(x = reorder(indel, indelrank), y = count, fill = indeltype, group = rep)) +
+      geom_bar(stat = "identity", colour = "black", width = 0.9, position = "dodge") +
+      # facet_grid(drug ~ .) +
+      scale_fill_manual(values = c("chocolate", "steelblue4")) +
+      labs(title = paste0("Effect of chromatin modulation on ", target),
+           x = "",
+           y = "Normalised count",
+           fill = "Condition") +
+      theme_cowplot() + theme(legend.position = "none")
+    
+    p2 <- ggplot(avg.fc.dt[sgrna == target & drug %in% c("TSA", "EZHi")], aes(x = reorder(indel, indelrank), y = l2fc, fill = dose, group = grp)) +
+      geom_bar(stat = "identity", colour = "black", width = 0.9, position = "dodge") +
+      scale_fill_manual(values = c("#deebf7", "#3182bd", "#fee0d2", "#de2d26")) +
+      # facet_grid(dose ~ .) +
+      # geom_hline(yintercept = 1, colour = "red", linetype = "dotted") +
+      # geom_hline(yintercept = -1, colour = "red", linetype = "dotted") +
+      geom_hline(yintercept = 0, colour = "gray50") +
+      coord_cartesian(ylim = c(-1.5, 1.5)) +
+      labs(x = "Indel",
+           y = "Log2 fold change") +
+      theme_cowplot() + theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+    
+    p <- plot_grid(p1, p2, ncol = 1, rel_heights = c(1, 2), align = "v")
+    
+    save_plot(plot = p, filename = paste0(output.dir, "/", target, ".indeltype.l2fc.combined.pdf"), base_width = 10, base_height = 10)
+
+}
+```

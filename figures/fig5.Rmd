@@ -1,0 +1,384 @@
+---
+title: "CRISPR Indels Fig. 5"
+author: "A. M. Chakrabarti"
+date: "Last updated: 16th October 2018"
+output: 
+  html_notebook: 
+    code_folding: hide
+    fig_align: center
+    fig_height: 10
+    fig_width: 12
+    highlight: haddock
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE}
+library(data.table)
+library(ggplot2)
+library(rtracklayer)
+library(cowplot)
+library(ggthemes)
+library(scales)
+library(parallel)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(pheatmap)
+library(stringr)
+library(RColorBrewer)
+library(dunn.test)
+library(CrispRVariants)
+library(viridis)
+library(ggforce)
+library(ggseqlogo)
+library(ggrepel)
+
+setwd("~/Scaffidi/revisions/")
+output.dir <- "~/Scaffidi/revisions/plots/fig5"
+if(!dir.exists(output.dir)) dir.create(output.dir)
+
+```
+
+# Get precision groups
+
+```{r}
+all.indels.gr <- readRDS("~/Scaffidi/revisions/all.indels.revised.gr.rds")
+
+indels.dt <- as.data.table(all.indels.gr)
+indels.dt[, indel_count := .N, by = .(seqnames, start, end, nt, sgrna)]
+indels.dt[, total_indels := .N, by = .(sgrna)]
+indels.dt[, indel_frequency := indel_count/total_indels]
+indels.dt[, max_indel_frequency := max(indel_frequency), by = sgrna]
+
+# Assign indel precision
+indels.dt[max_indel_frequency > 0 & max_indel_frequency <= 0.25, group := "I"]
+indels.dt[max_indel_frequency > 0.25 & max_indel_frequency <= 0.5, group := "M"]
+indels.dt[max_indel_frequency > 0.5 & max_indel_frequency <= 1, group := "P"]
+
+precision.group <- unique(indels.dt[total_indels >= 10, .(sgrna, group)])
+```
+
+F - Seqlogo of motif
+
+Get motif and define subgroups
+
+```{r}
+sgrna.dt <- fread("~/Dropbox (Lab)/CRISPR-indels/ref/sgrna.tsv")
+setnames(sgrna.dt, "id", "sgrna")
+
+setkey(sgrna.dt, sgrna)
+setkey(precision.group, sgrna)
+
+prec.seq.dt <- sgrna.dt[, .(sgrna, seq)][precision.group]
+prec.seq.dt[, motif := str_sub(seq, 16, 19)]
+
+# Add in insertion/deletion preferred
+id.ratio.dt <- indels.dt[, .N, by = .(sgrna, indel, total_indels, max_indel_frequency, group)]
+id.ratio.dt[, ratio := N/total_indels]
+
+# Sanity check that matches
+# ggplot(id.ratio.dt[total_indels >= 10 & indel == "Insertion"], aes(x = group, y = ratio, colour = group)) +
+#   geom_boxplot(width = 0.5) + geom_sina(shape = 1) +
+#   scale_colour_tableau() +
+#   scale_y_continuous(label = percent) +
+#   labs(# title = "Precision and type of indel",
+#        x = "Precision group",
+#        y = "Insertion rate",
+#        colour = "Precision group") +
+#   coord_cartesian(ylim = c(0, 1)) +
+#   theme_cowplot() + theme(legend.position = "none")
+
+# Fraction of P that prefer insertions
+nrow(id.ratio.dt[total_indels >= 10 & indel == "Insertion" & group == "P" & ratio > 0.5])/nrow(id.ratio.dt[total_indels >= 10 & indel == "Insertion" & group == "P"])
+
+prec.seq.dt[, group_extend := group]
+prec.seq.dt[sgrna %in% id.ratio.dt[indel == "Insertion" & group == "P" & ratio >= 0.5]$sgrna, group_extend := "P-ins"]
+prec.seq.dt[sgrna %in% id.ratio.dt[indel == "Insertion" & group == "P" & ratio < 0.5]$sgrna, group_extend := "P-del"]
+prec.seq.dt[group_extend == "P", group_extend := "P-del"] # For those where everything is a deletion
+```
+
+Plot seqlogos
+
+```{r}
+p.i <- ggplot() + 
+  geom_logo(prec.seq.dt[group_extend == "I"]$motif) +
+  # annotate('rect', xmin = 3.5, xmax = 4.5, ymin = 0, ymax = 0.8, alpha = .1, col='black', fill='yellow') +
+  annotate('rect', xmin = 1.5, xmax = 2.5, ymin = 0, ymax = 0.8, alpha = .1, col='black', fill='yellow') +
+  labs(title = "Imprecise") +
+  coord_cartesian(ylim = c(0, 0.8))
+
+p.m <- ggplot() + 
+  geom_logo(prec.seq.dt[group_extend == "M"]$motif) +
+  # annotate('rect', xmin = 3.5, xmax = 4.5, ymin = 0, ymax = 0.8, alpha = .1, col='black', fill='yellow') +
+  annotate('rect', xmin = 1.5, xmax = 2.5, ymin = 0, ymax = 0.8, alpha = .1, col='black', fill='yellow') +
+  labs(title = "Middle") +
+  coord_cartesian(ylim = c(0, 0.8))
+
+p.pi <- ggplot() + 
+  geom_logo(prec.seq.dt[group_extend == "P-ins"]$motif) +
+  # annotate('rect', xmin = 3.5, xmax = 4.5, ymin = 0, ymax = 0.8, alpha = .1, col='black', fill='yellow') +
+  annotate('rect', xmin = 1.5, xmax = 2.5, ymin = 0, ymax = 0.8, alpha = .1, col='black', fill='yellow') +
+  labs(title = "Precise - Insertion") +
+  coord_cartesian(ylim = c(0, 0.8))
+
+p.pd <- ggplot() + 
+  geom_logo(prec.seq.dt[group_extend == "P-del"]$motif) +
+  # annotate('rect', xmin = 3.5, xmax = 4.5, ymin = 0, ymax = 0.8, alpha = .1, col='black', fill='yellow') +
+  annotate('rect', xmin = 1.5, xmax = 2.5, ymin = 0, ymax = 0.8, alpha = .1, col='black', fill='yellow') +
+  labs(title = "Precise - Deletion") +
+  coord_cartesian(ylim = c(0, 0.8))
+
+ggsave(plot_grid(p.i, p.m, p.pi, p.pd, ncol = 4, align = "h"), filename = file.path(output.dir, "precision_core_bit.pdf"), width = 8, height = 2)
+```
+F - Pie charts of nt -4
+
+```{r}
+all.indels.gr <- readRDS("~/Scaffidi/revisions/all.indels.revised.gr.rds")
+indels.dt <- as.data.table(all.indels.gr)
+indels.dt[, indel_count := .N, by = .(seqnames, start, end, nt, sgrna)]
+indels.dt[, total_indels := .N, by = .(sgrna)]
+indels.dt[, indel_frequency := indel_count/total_indels]
+indels.dt[, max_indel_frequency := max(indel_frequency), by = sgrna]
+
+# Add sgRNA details
+sgrna.dt <- fread("~/Dropbox (Lab)/CRISPR-indels/ref/sgrna.tsv")
+setnames(sgrna.dt, "id", "sgrna")
+setkey(indels.dt, sgrna)
+setkey(sgrna.dt, sgrna)
+indels.dt <- sgrna.dt[, .(sgrna, seq)][indels.dt]
+
+res.threshold.dt <- indels.dt[total_indels >= 10]
+setorder(res.threshold.dt, sgrna, -indel_frequency, size)
+res.threshold.commonest.dt <- unique(res.threshold.dt[indel_frequency == max_indel_frequency], by = "sgrna") # if ties, take shortest
+
+# Annotate preferred indel type
+res.threshold.commonest.dt[max_indel_frequency > 0 & max_indel_frequency <= 0.25, group := "I"]
+res.threshold.commonest.dt[max_indel_frequency > 0.25 & max_indel_frequency <= 0.5, group := "M"]
+res.threshold.commonest.dt[max_indel_frequency > 0.5 & max_indel_frequency <= 1, group := "P"]
+res.threshold.commonest.dt[size < 0, indel := "Insertion"]
+res.threshold.commonest.dt[size > 0, indel := "Deletion"]
+res.threshold.commonest.dt[, cat_g := paste0(group, "-", indel)]
+
+# Get nt -4
+res.threshold.commonest.dt[, nt_17 := str_sub(seq, 17, 17)]
+
+res.threshold.commonest.pie.dt <- res.threshold.commonest.dt[, .N, by = .(nt_17, cat_g)]
+res.threshold.commonest.pie.dt$cat_g <- factor(res.threshold.commonest.pie.dt$cat_g, levels = c("P-Insertion", "M-Insertion", "I-Insertion", "P-Deletion", "M-Deletion", "I-Deletion"))
+
+p.list <- lapply(c("G", "C", "A", "T"), function(nt) {
+
+p <- ggplot(res.threshold.commonest.pie.dt[nt_17 == nt], aes(x = factor(1), y = N, fill = cat_g)) +
+  geom_bar(width = 0.9, stat = "identity") +
+  coord_polar(theta = "y", direction = -1) +
+  scale_fill_manual("", values = c("#26345F", "#669ED5", "#CBDFF3", "#C65517", "#F4992C", "#F9D2B6")) +
+  labs(title = nt) +
+  theme_cowplot() + 
+  theme(axis.text = element_blank(), axis.title = element_blank(), panel.border = element_blank(), panel.grid = element_blank(), axis.ticks = element_blank(), axis.line = element_blank(), legend.position = "none")
+
+ggsave(p, filename = file.path(output.dir, paste0(nt, "_nt17_commonest_indel.pdf")), width = 1.5, height = 1.5)    
+
+return(p)
+
+})
+
+ggsave(plot_grid(plotlist = p.list, nrow = 1, align = "hv"), filename = file.path(output.dir, "all_nt17_commonest_indel.pdf"), height = 1.5, width = 4)
+
+```
+
+# G - Precision and nt -4
+
+```{r}
+all.indels.gr <- readRDS("~/Scaffidi/revisions/all.indels.revised.gr.rds")
+
+indels.dt <- as.data.table(all.indels.gr)
+indels.dt[, indel_count := .N, by = .(seqnames, start, end, nt, sgrna)]
+indels.dt[, total_indels := .N, by = .(sgrna)]
+indels.dt[, indel_frequency := indel_count/total_indels]
+
+indels.dt[, max_indel_frequency := max(indel_frequency), by = sgrna]
+
+most.freq.dt <- unique(indels.dt[, .(sgrna, total_indels, max_indel_frequency)])
+
+most.freq.dt[max_indel_frequency > 0 & max_indel_frequency <= 0.25, group := "I"]
+most.freq.dt[max_indel_frequency > 0.25 & max_indel_frequency <= 0.5, group := "M"]
+most.freq.dt[max_indel_frequency > 0.5 & max_indel_frequency <= 1, group := "P"]
+
+precision.group <- unique(most.freq.dt[total_indels >= 10, .(sgrna, max_indel_frequency, group)])
+
+# Add sgRNA
+sgrna.dt <- fread("~/Dropbox (Lab)/CRISPR-indels/ref/sgrna.tsv")
+setnames(sgrna.dt, "id", "sgrna")
+setkey(precision.group, sgrna)
+setkey(sgrna.dt, sgrna)
+precision.group <- sgrna.dt[, .(sgrna, seq)][precision.group]
+
+precision.group[, nt_17 := str_sub(seq, 17, 17)]
+precision.group$nt_17 <- factor(precision.group$nt_17, levels = c("A", "T", "C", "G"))
+
+ggplot(precision.group, aes(x = nt_17, fill = group)) +
+  geom_bar(position = "fill") +
+  scale_fill_tableau(palette = "Classic 10") +
+  scale_y_continuous(label = percent) +
+  labs(x = "",
+       y = "Percentage of target sites") +
+  theme_cowplot() +
+  theme(legend.position = "none")
+
+precision.group[, .N, by = .(nt_17, group)]
+
+ggplot(precision.group, aes(x = nt_17, colour = nt_17)) +
+  geom_boxplot(width = 0.5, aes(y = max_indel_frequency)) +
+  geom_text(data = precision.group[, .N, by = nt_17], aes(label = N), y = 1) +
+  scale_colour_manual("", values = c("darkgreen", "red", "blue", "orange")) +
+  labs(x = "Nucleotide -4",
+       y = "Predictability",
+       fill = "") +
+  coord_cartesian(ylim = c(0, 1)) +
+  theme_cowplot() + theme(legend.position = "none")
+
+ggsave(file.path(output.dir, "predictability_nt17.pdf"), width = 5, height = 7, units = "in")
+```
+
+```{r}
+res.threshold.commonest.dt$nt_17 <- factor(res.threshold.commonest.dt$nt_17, levels = c("A", "T", "C", "G"))
+
+ggplot(res.threshold.commonest.dt, aes(x = nt_17, fill = indel)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(label = percent) +
+  scale_fill_manual(values = c("chocolate", "steelblue4")) +
+  labs(x = "",
+       y = "Percentage of target sites") +
+  theme_cowplot() +
+  theme(legend.position = "none")
+
+ggsave(file.path(output.dir, "id_nt17.pdf"), width = 5, height = 7, units = "in")
+```
+
+# H - Summary predictor plot
+
+```{r}
+all.indels.gr <- readRDS("~/Scaffidi/revisions/all.indels.revised.gr.rds")
+
+indels.dt <- as.data.table(all.indels.gr)
+indels.dt[, indel_count := .N, by = .(seqnames, start, end, nt, sgrna)]
+indels.dt[, total_indels := .N, by = .(sgrna)]
+indels.dt[, indel_frequency := indel_count/total_indels]
+indels.dt[, max_indel_frequency := max(indel_frequency), by = sgrna]
+
+# Assign indel precision
+indels.dt[max_indel_frequency > 0 & max_indel_frequency <= 0.25, group := "I"]
+indels.dt[max_indel_frequency > 0.25 & max_indel_frequency <= 0.5, group := "M"]
+indels.dt[max_indel_frequency > 0.5 & max_indel_frequency <= 1, group := "P"]
+
+indels.dt[, exp := NULL]
+indels.dt <- unique(indels.dt)
+
+# Add sgRNA details
+sgrna.dt <- fread("~/Dropbox (Lab)/CRISPR-indels/ref/sgrna.tsv")
+setnames(sgrna.dt, "id", "sgrna")
+setkey(indels.dt, sgrna)
+setkey(sgrna.dt, sgrna)
+indels.dt <- sgrna.dt[, .(sgrna, seq)][indels.dt]
+
+res.threshold.dt <- indels.dt[total_indels >= 10]
+setorder(res.threshold.dt, sgrna, -indel_frequency, size)
+res.threshold.commonest.dt <- unique(res.threshold.dt[indel_frequency == max_indel_frequency], by = "sgrna") # if ties, take shortest
+
+res.threshold.commonest.dt[, nt_17 := str_sub(seq, 17, 17)]
+res.threshold.commonest.dt[size < 0, indel_type := "Insertion"]
+res.threshold.commonest.dt[size > 0, indel_type := "Deletion"]
+
+res.threshold.commonest.dt[, cat_g := paste0(group, "-", indel_type)]
+res.threshold.commonest.dt[, nt_1617 := str_sub(seq, 16, 17)]
+
+# Counts/Size
+# First do -4
+count17 <- res.threshold.commonest.dt
+count17[, total := .N, by = nt_17]
+count17[, medcom := median(max_indel_frequency), by = nt_17]
+count17 <- unique(count17[, .(nt_17, total, medcom)])
+# Then do -5-4
+count1617 <- res.threshold.commonest.dt
+count1617[, total := .N, by = nt_1617]
+count1617[, medcom := median(max_indel_frequency), by = nt_1617]
+count1617 <- unique(count1617[, .(nt_1617, total, medcom)])
+
+# Frequencies
+# 17 precision
+p.freq17 <- res.threshold.commonest.dt[, .N, by = .(group, nt_17)]
+p.freq17[, total := sum(N), by = nt_17]
+p.freq17[, percent := N/total]
+setorder(p.freq17, -percent)
+p.freq17 <- dcast.data.table(p.freq17, nt_17 ~ group, value.var = "percent")
+# 1617 precision
+p.freq1617 <- res.threshold.commonest.dt[, .N, by = .(group, nt_1617)]
+p.freq1617[, total := sum(N), by = nt_1617]
+p.freq1617[, percent := N/total]
+setorder(p.freq1617, -percent)
+p.freq1617 <- dcast.data.table(p.freq1617, nt_1617 ~ group, value.var = "percent")
+
+# 17 i/d
+id.freq17 <- res.threshold.commonest.dt[, .N, by = .(indel_type, nt_17)]
+id.freq17[, total := sum(N), by = nt_17]
+id.freq17[, percent := N/total]
+setorder(id.freq17, -percent)
+id.freq17 <- dcast.data.table(id.freq17, nt_17 ~ indel_type, value.var = "percent")
+# 1617 i/d
+id.freq1617 <- res.threshold.commonest.dt[, .N, by = .(indel_type, nt_1617)]
+id.freq1617[, total := sum(N), by = nt_1617]
+id.freq1617[, percent := N/total]
+setorder(id.freq1617, -percent)
+id.freq1617 <- dcast.data.table(id.freq1617, nt_1617 ~ indel_type, value.var = "percent")
+
+# Combine all
+t17 <- merge(count17, p.freq17, by = "nt_17")
+t17 <- merge(t17, id.freq17, by = "nt_17")
+
+t1617 <- merge(count1617, p.freq1617, by = "nt_1617")
+t1617 <- merge(t1617, id.freq1617, by = "nt_1617")
+
+t17_t1617 <- rbind(t17, t1617, fill = TRUE, use.names = TRUE, idcol = NULL)
+
+t17_t1617[, minus4 := nt_17]
+t17_t1617[is.na(minus4), minus4 := str_sub(nt_1617, 2, 2)]
+t17_t1617[, minus5 := str_sub(nt_1617, 1, 1)]
+t17_t1617[is.na(minus5), minus5 := "N"]
+
+results <- t17_t1617[, .(minus5, minus4, medcom, P, M, I, Insertion, Deletion, total)]
+results$medcom <- round(results$medcom, 2)
+results$P <- round(results$P * 100, 1)
+results$M <- round(results$M * 100, 1)
+results$I <- round(results$I * 100, 1)
+results$Insertion <- round(results$Insertion * 100, 1)
+results$Deletion <- round(results$Deletion * 100, 1)
+
+setnames(results, c("-5", "-4", "Median commonest frequency", "Precise", "Middle", "Imprecise", "Insertion", "Deletion", "Number of sites"))
+setorder(results, -`Median commonest frequency`, -Precise)
+fwrite(results, "~/Dropbox (Lab)/CRISPR-indels/resubmission/Figures/supplementary_tables/table_SX_predictability_summary.tsv", sep = "\t", quote = FALSE)
+
+
+# Now plot
+
+results[, id := paste0(`-5`, `-4`)]
+results[`Median commonest frequency` >= 0.48 & Insertion > 50, `:=` (label = id, fill = "Precise insertions")]
+results[`Median commonest frequency` <= 0.25 & Insertion < 50, `:=` (label = id, fill = "Imprecise deletions")]
+results[id == "CC", `:=` (label = id, fill = "Precise deletions")]
+results[is.na(label), `:=` (label = "", fill = "Middle")]
+ 
+ ggplot(results[fill != "Middle"], aes(x = `Median commonest frequency`, y = Insertion/100, label = label, colour = fill)) +
+   geom_point(aes(fill = fill), size = 3, shape = 21) +
+   geom_label_repel(data = results[fill == "Precise insertions"], direction = "both", nudge_x = 0.1, nudge_y = 0) +
+   geom_label_repel(data = results[fill == "Imprecise deletions"], direction = "both", nudge_x = -0.1, nudge_y = 0) +
+   geom_label_repel(data = results[fill == "Precise deletions"], direction = "both", nudge_x = 0.1, nudge_y = 0) +
+   coord_cartesian(xlim = c(0, 0.75), ylim = c(0, 1)) +
+   scale_colour_manual(values = c("#1f77b4", "#2ca02c", "#2ca02c"), guide = FALSE) +
+   scale_fill_manual(values = c("#1f77b4", "#2ca02c", "#2ca02c"), guide = FALSE) +
+   # scale_fill_manual(values = c("chocolate", "chocolate", "steelblue4"), guide = FALSE) +
+   labs(x = "Precision probability",
+        y = "Insertion probability")
+ 
+ggsave(file.path(output.dir, "selection_tool.pdf"), width = 4, height = 4)
+```
+
